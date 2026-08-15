@@ -12,6 +12,9 @@ import torch.optim as optim
 from sentence_transformers import SentenceTransformer
 
 DEFAULT_GAME_PATH = Path("/home/jeff/ExpanDrive/Google Drive/Games/ZCode/advent.z5")
+DEFAULT_EPISODES = 20000
+DEFAULT_MAX_STEPS = 200
+DEFAULT_WALKTHROUGH_STEPS = 500
 
 # --------------------------------------------------
 # 1. Custom Text Adventure Environment Wrapper
@@ -83,15 +86,20 @@ class FrotzEnv:
 
         # Retrieve score to build reward signal
         score = self._get_score()
-        
-        # Basic reward structure: score change or small step penalty
-        reward = float(score) - getattr(self, 'last_score', 0)
+        score_delta = float(score) - getattr(self, 'last_score', 0)
         self.last_score = score
+
+        reward = score_delta * 2.0
         if reward == 0:
-            reward = -0.01  # Small penalty to discourage infinite loops
+            reward = -0.05
 
         done = False
-        if "you have died" in output.lower() or "you win" in output.lower():
+        lower_output = output.lower()
+        if "you have died" in lower_output:
+            reward -= 10.0
+            done = True
+        elif "you win" in lower_output:
+            reward += 50.0
             done = True
 
         return output, reward, done, {}
@@ -141,95 +149,146 @@ ReplayBuffer = collections.deque(maxlen=2000)
 # --------------------------------------------------
 # 3. Training Loop
 # --------------------------------------------------
-def train_dqn(game_path=None, frotz_bin="dfrotz"):
+def train_dqn(game_path=None, frotz_bin="dfrotz", episodes=DEFAULT_EPISODES, max_steps_per_ep=DEFAULT_MAX_STEPS):
     env = FrotzEnv(game_path=game_path, frotz_bin=frotz_bin)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Pre-trained NLP Encoder for state text representations
     encoder = SentenceTransformer('all-MiniLM-L6-v2').to(device)
-    state_dim = 384  # Embedding dimension of all-MiniLM-L6-v2
+    state_dim = 384
     num_actions = len(env.action_space)
 
-    # Hyperparameters
     gamma = 0.99
     epsilon = 1.0
     epsilon_min = 0.05
     epsilon_decay = 0.995
     lr = 1e-3
     batch_size = 32
-    episodes = 50
-    max_steps_per_ep = 30
 
     q_net = QNetwork(state_dim, num_actions).to(device)
     target_net = QNetwork(state_dim, num_actions).to(device)
     target_net.load_state_dict(q_net.state_dict())
     optimizer = optim.Adam(q_net.parameters(), lr=lr)
 
-    for ep in range(episodes):
-        state_text = env.reset()
-        state_emb = encoder.encode(state_text, convert_to_tensor=True, device=device).detach()
-        total_reward = 0
+    try:
+        for ep in range(episodes):
+            state_text = env.reset()
+            state_emb = encoder.encode(state_text, convert_to_tensor=True, device=device).detach()
+            total_reward = 0.0
 
-        for step in range(max_steps_per_ep):
-            # Epsilon-greedy action selection
-            if random.random() < epsilon:
-                action_idx = random.randint(0, num_actions - 1)
-            else:
-                with torch.no_grad():
-                    q_values = q_net(state_emb.unsqueeze(0))
-                    action_idx = torch.argmax(q_values).item()
+            for step in range(max_steps_per_ep):
+                if random.random() < epsilon:
+                    action_idx = random.randint(0, num_actions - 1)
+                else:
+                    with torch.no_grad():
+                        q_values = q_net(state_emb.unsqueeze(0))
+                        action_idx = torch.argmax(q_values).item()
 
-            action_str = env.action_space[action_idx]
-            next_state_text, reward, done, _ = env.step(action_str)
-            next_state_emb = encoder.encode(next_state_text, convert_to_tensor=True, device=device).detach()
+                action_str = env.action_space[action_idx]
+                next_state_text, reward, done, _ = env.step(action_str)
+                next_state_emb = encoder.encode(next_state_text, convert_to_tensor=True, device=device).detach()
 
-            # Save transition
-            ReplayBuffer.append((state_emb, action_idx, reward, next_state_emb, done))
-            state_emb = next_state_emb
-            total_reward += reward
+                ReplayBuffer.append((state_emb, action_idx, reward, next_state_emb, done))
+                state_emb = next_state_emb
+                total_reward += reward
 
-            # Train Network
-            if len(ReplayBuffer) >= batch_size:
-                batch = random.sample(ReplayBuffer, batch_size)
-                s_b, a_b, r_b, ns_b, d_b = zip(*batch)
+                if len(ReplayBuffer) >= batch_size:
+                    batch = random.sample(ReplayBuffer, batch_size)
+                    s_b, a_b, r_b, ns_b, d_b = zip(*batch)
 
-                s_b = torch.stack(s_b).to(device)
-                a_b = torch.tensor(a_b, dtype=torch.long, device=device).unsqueeze(1)
-                r_b = torch.tensor(r_b, dtype=torch.float32, device=device).unsqueeze(1)
-                ns_b = torch.stack(ns_b).to(device)
-                d_b = torch.tensor(d_b, dtype=torch.float32, device=device).unsqueeze(1)
+                    s_b = torch.stack(s_b).to(device)
+                    a_b = torch.tensor(a_b, dtype=torch.long, device=device).unsqueeze(1)
+                    r_b = torch.tensor(r_b, dtype=torch.float32, device=device).unsqueeze(1)
+                    ns_b = torch.stack(ns_b).to(device)
+                    d_b = torch.tensor(d_b, dtype=torch.float32, device=device).unsqueeze(1)
 
-                current_q = q_net(s_b).gather(1, a_b)
-                max_next_q = target_net(ns_b).max(1)[0].unsqueeze(1)
-                target_q = r_b + (1 - d_b) * gamma * max_next_q
+                    current_q = q_net(s_b).gather(1, a_b)
+                    max_next_q = target_net(ns_b).max(1)[0].unsqueeze(1)
+                    target_q = r_b + (1 - d_b) * gamma * max_next_q
 
-                loss = nn.MSELoss()(current_q, target_q.detach())
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                    loss = nn.MSELoss()(current_q, target_q.detach())
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
 
-            if done:
-                break
+                if done:
+                    break
 
-        # Decay epsilon and sync target network
-        epsilon = max(epsilon_min, epsilon * epsilon_decay)
-        if ep % 5 == 0:
-            target_net.load_state_dict(q_net.state_dict())
+            epsilon = max(epsilon_min, epsilon * epsilon_decay)
+            if ep % 5 == 0:
+                target_net.load_state_dict(q_net.state_dict())
 
-        print(f"Episode {ep + 1}/{episodes} | Total Reward: {total_reward:.2f} | Epsilon: {epsilon:.2f}")
+            print(f"Episode {ep + 1}/{episodes} | Total Reward: {total_reward:.2f} | Epsilon: {epsilon:.2f}")
+    finally:
+        env.close()
 
-    env.close()
+    return q_net, encoder, device
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a DQN agent on an IF game via Frotz.")
     parser.add_argument("--game-path", type=str, default=None, help="Path to the Z-machine game file, e.g. Advent.z5")
     parser.add_argument("--frotz-bin", type=str, default="dfrotz", help="Path or name of the dfrotz executable")
+    parser.add_argument("--episodes", type=int, default=DEFAULT_EPISODES, help="Number of training episodes to run")
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Max steps per training episode")
+    parser.add_argument("--walkthrough-steps", type=int, default=DEFAULT_WALKTHROUGH_STEPS, help="Max steps to use during the final learned walkthrough")
+    parser.add_argument("--smoke-test", action="store_true", help="Run a single look command instead of the full training + walkthrough")
+    parser.add_argument("--long-run", action="store_true", help="Use a weekend-scale default configuration for extended training")
     return parser.parse_args()
+
+
+def play_walkthrough(env, q_net, encoder, device, max_steps=DEFAULT_MAX_STEPS):
+    print("\n--- STARTING FULL WALKTHROUGH ---\n")
+    q_net.eval()
+    state_text = env.reset()
+    print(f"[Initial Observation]: {state_text}\n")
+
+    total_reward = 0.0
+    for step in range(1, max_steps + 1):
+        state_emb = encoder.encode(state_text, convert_to_tensor=True, device=device).detach()
+        with torch.no_grad():
+            q_values = q_net(state_emb.unsqueeze(0))
+            action_idx = torch.argmax(q_values).item()
+
+        action_str = env.action_space[action_idx]
+        next_state_text, reward, done, _ = env.step(action_str)
+        total_reward += reward
+
+        print(f"Step {step} | Action: '{action_str}' | Reward: {reward:.2f}")
+        print(f"Game Response: {next_state_text}\n")
+
+        state_text = next_state_text
+        if done:
+            print("--- GAME ENDED ---")
+            break
+
+    print(f"Walkthrough Finished | Cumulative Reward: {total_reward:.2f}\n")
 
 
 if __name__ == "__main__":
     args = parse_args()
-    try:
-        train_dqn(game_path=args.game_path, frotz_bin=args.frotz_bin)
-    except FileNotFoundError as exc:
-        raise SystemExit(f"Missing game asset: {exc}")
+    if args.long_run:
+        args.episodes = max(args.episodes, DEFAULT_EPISODES)
+        args.max_steps = max(args.max_steps, DEFAULT_MAX_STEPS)
+        args.walkthrough_steps = max(args.walkthrough_steps, DEFAULT_WALKTHROUGH_STEPS)
+
+    game_path = args.game_path or str(DEFAULT_GAME_PATH)
+
+    if args.smoke_test:
+        env = FrotzEnv(game_path=game_path, frotz_bin=args.frotz_bin)
+        try:
+            print("\n--- STARTING ENVIRONMENT SMOKE TEST ---\n")
+            state_text = env.reset()
+            print(f"[Initial Observation]: {state_text}\n")
+            action_str = "look"
+            next_state_text, reward, done, _ = env.step(action_str)
+            print(f"Action: '{action_str}' | Reward: {reward:.2f}")
+            print(f"Game Response: {next_state_text}\n")
+        finally:
+            env.close()
+    else:
+        q_net, encoder, device = train_dqn(game_path=game_path, frotz_bin=args.frotz_bin, episodes=args.episodes, max_steps_per_ep=args.max_steps)
+        env = FrotzEnv(game_path=game_path, frotz_bin=args.frotz_bin)
+        try:
+            play_walkthrough(env, q_net, encoder, device, max_steps=args.walkthrough_steps)
+        finally:
+            env.close()
