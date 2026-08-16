@@ -291,4 +291,4 @@ if __name__ == "__main__":
         try:
             play_walkthrough(env, q_net, encoder, device, max_steps=args.walkthrough_steps)
         finally:
-        k    env.close()
+            env.close()
