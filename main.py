@@ -1,116 +1,94 @@
-import argparse
 import re
 import random
-import collections
+import argparse
 from pathlib import Path
 import shutil
 import pexpect
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from sentence_transformers import SentenceTransformer
 
-DEFAULT_GAME_PATH = Path("/home/jeff/ExpanDrive/Google Drive/Games/ZCode/advent.z5")
-DEFAULT_EPISODES = 20000
-DEFAULT_MAX_STEPS = 200
-DEFAULT_WALKTHROUGH_STEPS = 500
+DEFAULT_GAME_PATH = Path.home() / "Games" / "ZCode" / "advent.z5"
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
-# --------------------------------------------------
-# 1. Custom Text Adventure Environment Wrapper
-# --------------------------------------------------
 class FrotzEnv:
-    def __init__(self, game_path=None, frotz_bin="dfrotz"):
+    def __init__(self, game_path=None, frotz_bin="frotz"):
         self.frotz_bin = shutil.which(frotz_bin) or frotz_bin
         if not shutil.which(frotz_bin) and not Path(frotz_bin).exists():
-            raise FileNotFoundError(
-                f"Frotz executable '{frotz_bin}' was not found. Install frotz or pass --frotz-bin with the correct path."
-            )
+            raise FileNotFoundError(f"Frotz executable '{frotz_bin}' was not found.")
         self.game_path = self._resolve_game_path(game_path)
         self.child = None
 
-        # Action space: Basic navigation & interaction commands
         self.action_space = [
             "look", "inventory", "north", "south", "east", "west",
             "up", "down", "in", "out", "take all", "drop all",
-            "open door", "examine lamp", "take lamp", "light lamp", "score"
+            "open door", "examine lamp", "take lamp", "light lamp"
         ]
 
     def _resolve_game_path(self, game_path=None):
         candidates = []
-
         if game_path is not None:
             candidates.append(Path(game_path))
         else:
             candidates.append(DEFAULT_GAME_PATH)
 
-        default_names = ["Advent.z5", "advent.z5", "advent.z8", "Advent.z8"]
-        for name in default_names:
+        for name in ["advent.z5", "Advent.z5", "advent.z8", "Advent.z8"]:
+            candidates.append(Path.home() / "Games" / "ZCode" / name)
             candidates.append(Path.cwd() / name)
-            candidates.append(Path.cwd() / "IFGamePlayer" / name)
 
-        root = Path.cwd()
-        for pattern in ("*.z1", "*.z2", "*.z3", "*.z4", "*.z5", "*.z6", "*.z7", "*.z8"):
-            candidates.extend(sorted(root.rglob(pattern)))
-
-        seen = set()
         for candidate in candidates:
             resolved = candidate.expanduser().resolve()
-            if resolved.is_file() and resolved not in seen:
-                seen.add(resolved)
+            if resolved.is_file():
                 return str(resolved)
 
-        raise FileNotFoundError(
-            "No Z-machine game file was found. Place a game such as Advent.z5 in the project root or pass game_path explicitly."
-        )
+        raise FileNotFoundError(f"No Z-machine game file found at {DEFAULT_GAME_PATH} or alternative candidates.")
 
     def reset(self):
         if self.child and self.child.isalive():
             self.child.close()
 
-        # Spawn dfrotz non-interactively using argument list to avoid shell quoting issues.
-        self.child = pexpect.spawn(self.frotz_bin, [self.game_path], encoding='utf-8', timeout=2)
-        self.child.expect('>')  # Wait for command prompt
-        raw_output = self.child.before
+        # Launch frotz with plain output (-p) and quiet mode (-q)
+        # Use standard pty terminal dimensions to keep frotz stable
+        self.child = pexpect.spawn(
+            self.frotz_bin, 
+            ["-p", "-q", self.game_path], 
+            encoding='utf-8', 
+            dimensions=(24, 80),
+            timeout=2
+        )
+        self._wait_for_prompt()
+        return self._clean_text(self.child.before)
 
-        return self._clean_text(raw_output)
+    def _wait_for_prompt(self):
+        # Match standard prompt > or fall back gracefully on timeout
+        try:
+            self.child.expect([r'>', pexpect.TIMEOUT], timeout=1.0)
+        except pexpect.EOF:
+            pass
 
     def step(self, action_str):
         if not self.child or not self.child.isalive():
-            raise RuntimeError("Environment terminal or not initialized.")
+            raise RuntimeError("Environment not initialized.")
 
-        # Send action to frotz
         self.child.sendline(action_str)
-        self.child.expect('>')
+        self._wait_for_prompt()
         output = self._clean_text(self.child.before)
 
-        # Retrieve score to build reward signal
         score = self._get_score()
-        score_delta = float(score) - getattr(self, 'last_score', 0)
+        reward = float(score) - getattr(self, 'last_score', 0)
         self.last_score = score
-
-        reward = score_delta * 2.0
         if reward == 0:
-            reward = -0.05
+            reward = -0.01
 
         done = False
-        lower_output = output.lower()
-        if "you have died" in lower_output:
-            reward -= 10.0
-            done = True
-        elif "you win" in lower_output:
-            reward += 50.0
+        if "you have died" in output.lower() or "you win" in output.lower():
             done = True
 
         return output, reward, done, {}
 
     def _get_score(self):
-        """Query score silently from game state."""
         try:
             self.child.sendline("score")
-            self.child.expect('>')
-            score_text = self.child.before
-            match = re.search(r'score of (\d+)', score_text, re.IGNORECASE)
+            self._wait_for_prompt()
+            clean = ANSI_ESCAPE.sub('', self.child.before)
+            match = re.search(r'score of (\d+)', clean, re.IGNORECASE)
             if match:
                 return int(match.group(1))
         except Exception:
@@ -118,8 +96,10 @@ class FrotzEnv:
         return 0
 
     def _clean_text(self, text):
-        """Remove control characters and standard prompt noise."""
-        lines = text.splitlines()
+        if not text:
+            return ""
+        clean = ANSI_ESCAPE.sub('', text)
+        lines = clean.splitlines()
         cleaned = [l.strip() for l in lines if l.strip() and not l.strip().startswith('>')]
         return " ".join(cleaned)
 
@@ -127,168 +107,94 @@ class FrotzEnv:
         if self.child and self.child.isalive():
             self.child.close()
 
-# --------------------------------------------------
-# 2. DQN Neural Network & Replay Buffer
-# --------------------------------------------------
-class QNetwork(nn.Module):
-    def __init__(self, state_dim, num_actions):
-        super(QNetwork, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_actions)
-        )
+class TabularQAgent:
+    def __init__(self, actions, alpha=0.1, gamma=0.99, epsilon=1.0, epsilon_decay=0.99995, epsilon_min=0.01):
+        self.actions = actions
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        self.q_table = {}
 
-    def forward(self, x):
-        return self.fc(x)
+    def get_q_values(self, state):
+        if state not in self.q_table:
+            self.q_table[state] = [0.0] * len(self.actions)
+        return self.q_table[state]
 
-ReplayBuffer = collections.deque(maxlen=2000)
+    def choose_action(self, state, greedy=False):
+        q_vals = self.get_q_values(state)
+        if not greedy and random.random() < self.epsilon:
+            return random.randint(0, len(self.actions) - 1)
+        
+        max_v = max(q_vals)
+        best_indices = [i for i, v in enumerate(q_vals) if v == max_v]
+        return random.choice(best_indices)
 
-# --------------------------------------------------
-# 3. Training Loop
-# --------------------------------------------------
-def train_dqn(game_path=None, frotz_bin="dfrotz", episodes=DEFAULT_EPISODES, max_steps_per_ep=DEFAULT_MAX_STEPS):
-    env = FrotzEnv(game_path=game_path, frotz_bin=frotz_bin)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def update(self, state, action, reward, next_state, done):
+        q_vals = self.get_q_values(state)
+        next_q_vals = self.get_q_values(next_state)
+        
+        max_next_q = max(next_q_vals) if not done else 0.0
+        target = reward + self.gamma * max_next_q
+        q_vals[action] += self.alpha * (target - q_vals[action])
 
-    encoder = SentenceTransformer('all-MiniLM-L6-v2').to(device)
-    state_dim = 384
-    num_actions = len(env.action_space)
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-    gamma = 0.99
-    epsilon = 1.0
-    epsilon_min = 0.05
-    epsilon_decay = 0.995
-    lr = 1e-3
-    batch_size = 32
+def train(env, agent, episodes=70000, max_steps=30):
+    for ep in range(episodes):
+        state = env.reset()
+        total_reward = 0
 
-    q_net = QNetwork(state_dim, num_actions).to(device)
-    target_net = QNetwork(state_dim, num_actions).to(device)
-    target_net.load_state_dict(q_net.state_dict())
-    optimizer = optim.Adam(q_net.parameters(), lr=lr)
+        for step in range(max_steps):
+            action_idx = agent.choose_action(state)
+            action_str = env.action_space[action_idx]
+            
+            next_state, reward, done, _ = env.step(action_str)
+            agent.update(state, action_idx, reward, next_state, done)
+            
+            state = next_state
+            total_reward += reward
+            if done:
+                break
 
-    try:
-        for ep in range(episodes):
-            state_text = env.reset()
-            state_emb = encoder.encode(state_text, convert_to_tensor=True, device=device).detach()
-            total_reward = 0.0
+        agent.decay_epsilon()
+        if (ep + 1) % 1000 == 0 or ep == episodes - 1:
+            print(f"Episode {ep + 1}/{episodes} | Total Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.4f}", flush=True)
 
-            for step in range(max_steps_per_ep):
-                if random.random() < epsilon:
-                    action_idx = random.randint(0, num_actions - 1)
-                else:
-                    with torch.no_grad():
-                        q_values = q_net(state_emb.unsqueeze(0))
-                        action_idx = torch.argmax(q_values).item()
+def play_walkthrough(env, agent, max_steps=50):
+    print("\n--- STARTING TRAINED WALKTHROUGH ---\n")
+    state = env.reset()
+    print(f"[Initial Observation]: {state}\n")
+    total_reward = 0
 
-                action_str = env.action_space[action_idx]
-                next_state_text, reward, done, _ = env.step(action_str)
-                next_state_emb = encoder.encode(next_state_text, convert_to_tensor=True, device=device).detach()
-
-                ReplayBuffer.append((state_emb, action_idx, reward, next_state_emb, done))
-                state_emb = next_state_emb
-                total_reward += reward
-
-                if len(ReplayBuffer) >= batch_size:
-                    batch = random.sample(ReplayBuffer, batch_size)
-                    s_b, a_b, r_b, ns_b, d_b = zip(*batch)
-
-                    s_b = torch.stack(s_b).to(device)
-                    a_b = torch.tensor(a_b, dtype=torch.long, device=device).unsqueeze(1)
-                    r_b = torch.tensor(r_b, dtype=torch.float32, device=device).unsqueeze(1)
-                    ns_b = torch.stack(ns_b).to(device)
-                    d_b = torch.tensor(d_b, dtype=torch.float32, device=device).unsqueeze(1)
-
-                    current_q = q_net(s_b).gather(1, a_b)
-                    max_next_q = target_net(ns_b).max(1)[0].unsqueeze(1)
-                    target_q = r_b + (1 - d_b) * gamma * max_next_q
-
-                    loss = nn.MSELoss()(current_q, target_q.detach())
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                if done:
-                    break
-
-            epsilon = max(epsilon_min, epsilon * epsilon_decay)
-            if ep % 5 == 0:
-                target_net.load_state_dict(q_net.state_dict())
-
-            print(f"Episode {ep + 1}/{episodes} | Total Reward: {total_reward:.2f} | Epsilon: {epsilon:.2f}")
-    finally:
-        env.close()
-
-    return q_net, encoder, device
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a DQN agent on an IF game via Frotz.")
-    parser.add_argument("--game-path", type=str, default=None, help="Path to the Z-machine game file, e.g. Advent.z5")
-    parser.add_argument("--frotz-bin", type=str, default="dfrotz", help="Path or name of the dfrotz executable")
-    parser.add_argument("--episodes", type=int, default=DEFAULT_EPISODES, help="Number of training episodes to run")
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Max steps per training episode")
-    parser.add_argument("--walkthrough-steps", type=int, default=DEFAULT_WALKTHROUGH_STEPS, help="Max steps to use during the final learned walkthrough")
-    parser.add_argument("--smoke-test", action="store_true", help="Run a single look command instead of the full training + walkthrough")
-    parser.add_argument("--long-run", action="store_true", help="Use a weekend-scale default configuration for extended training")
-    return parser.parse_args()
-
-
-def play_walkthrough(env, q_net, encoder, device, max_steps=DEFAULT_MAX_STEPS):
-    print("\n--- STARTING FULL WALKTHROUGH ---\n")
-    q_net.eval()
-    state_text = env.reset()
-    print(f"[Initial Observation]: {state_text}\n")
-
-    total_reward = 0.0
     for step in range(1, max_steps + 1):
-        state_emb = encoder.encode(state_text, convert_to_tensor=True, device=device).detach()
-        with torch.no_grad():
-            q_values = q_net(state_emb.unsqueeze(0))
-            action_idx = torch.argmax(q_values).item()
-
+        action_idx = agent.choose_action(state, greedy=True)
         action_str = env.action_space[action_idx]
-        next_state_text, reward, done, _ = env.step(action_str)
+
+        next_state, reward, done, _ = env.step(action_str)
         total_reward += reward
 
         print(f"Step {step} | Action: '{action_str}' | Reward: {reward:.2f}")
-        print(f"Game Response: {next_state_text}\n")
+        print(f"Game Response: {next_state}\n")
 
-        state_text = next_state_text
+        state = next_state
         if done:
-            print("--- GAME ENDED ---")
             break
 
     print(f"Walkthrough Finished | Cumulative Reward: {total_reward:.2f}\n")
 
-
 if __name__ == "__main__":
-    args = parse_args()
-    if args.long_run:
-        args.episodes = max(args.episodes, DEFAULT_EPISODES)
-        args.max_steps = max(args.max_steps, DEFAULT_MAX_STEPS)
-        args.walkthrough_steps = max(args.walkthrough_steps, DEFAULT_WALKTHROUGH_STEPS)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--game-path", type=str, default=None)
+    parser.add_argument("--frotz-bin", type=str, default="frotz")
+    parser.add_argument("--episodes", type=int, default=70000)
+    args = parser.parse_args()
 
-    game_path = args.game_path or str(DEFAULT_GAME_PATH)
+    env = FrotzEnv(game_path=args.game_path, frotz_bin=args.frotz_bin)
+    agent = TabularQAgent(actions=env.action_space)
 
-    if args.smoke_test:
-        env = FrotzEnv(game_path=game_path, frotz_bin=args.frotz_bin)
-        try:
-            print("\n--- STARTING ENVIRONMENT SMOKE TEST ---\n")
-            state_text = env.reset()
-            print(f"[Initial Observation]: {state_text}\n")
-            action_str = "look"
-            next_state_text, reward, done, _ = env.step(action_str)
-            print(f"Action: '{action_str}' | Reward: {reward:.2f}")
-            print(f"Game Response: {next_state_text}\n")
-        finally:
-            env.close()
-    else:
-        q_net, encoder, device = train_dqn(game_path=game_path, frotz_bin=args.frotz_bin, episodes=args.episodes, max_steps_per_ep=args.max_steps)
-        env = FrotzEnv(game_path=game_path, frotz_bin=args.frotz_bin)
-        try:
-            play_walkthrough(env, q_net, encoder, device, max_steps=args.walkthrough_steps)
-        finally:
-            env.close()
+    train(env, agent, episodes=args.episodes, max_steps=30)
+    play_walkthrough(env, agent, max_steps=50)
+    env.close()
