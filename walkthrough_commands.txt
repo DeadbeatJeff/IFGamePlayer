@@ -1,0 +1,50 @@
+look
+east
+north
+west
+east
+up
+take all
+take lamp
+inventory
+take all
+drop all
+take all
+take all
+out
+inventory
+examine lamp
+drop all
+down
+down
+north
+take all
+look
+north
+look
+north
+south
+east
+north
+east
+light lamp
+up
+inventory
+light lamp
+up
+north
+up
+take all
+down
+east
+in
+take lamp
+take all
+look
+up
+open door
+look
+east
+inventory
+down
+light lamp
