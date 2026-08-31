@@ -1,12 +1,15 @@
 import re
 import random
 import argparse
+import json
 from pathlib import Path
 import shutil
 import pexpect
 
 DEFAULT_GAME_PATH = Path.home() / "Games" / "ZCode" / "advent.z5"
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+CHECKPOINT_FILE = "q_checkpoint.json"
+WALKTHROUGH_FILE = "walkthrough_commands.txt"
 
 class FrotzEnv:
     def __init__(self, game_path=None, frotz_bin="frotz"):
@@ -44,8 +47,6 @@ class FrotzEnv:
         if self.child and self.child.isalive():
             self.child.close()
 
-        # Launch frotz with plain output (-p) and quiet mode (-q)
-        # Use standard pty terminal dimensions to keep frotz stable
         self.child = pexpect.spawn(
             self.frotz_bin, 
             ["-p", "-q", self.game_path], 
@@ -57,7 +58,6 @@ class FrotzEnv:
         return self._clean_text(self.child.before)
 
     def _wait_for_prompt(self):
-        # Match standard prompt > or fall back gracefully on timeout
         try:
             self.child.expect([r'>', pexpect.TIMEOUT], timeout=1.0)
         except pexpect.EOF:
@@ -142,8 +142,31 @@ class TabularQAgent:
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
-def train(env, agent, episodes=70000, max_steps=30):
-    for ep in range(episodes):
+    def save_checkpoint(self, episode, path=CHECKPOINT_FILE):
+        data = {
+            'episode': episode,
+            'epsilon': self.epsilon,
+            'q_table': self.q_table
+        }
+        with open(path, 'w') as f:
+            json.dump(data, f)
+        print(f"[Info]: Saved checkpoint at episode {episode} to {path}", flush=True)
+
+    def load_checkpoint(self, path=CHECKPOINT_FILE):
+        if Path(path).exists():
+            with open(path, 'r') as f:
+                data = json.load(f)
+            self.q_table = data.get('q_table', {})
+            self.epsilon = data.get('epsilon', self.epsilon)
+            start_ep = data.get('episode', 0)
+            print(f"[Info]: Resuming from episode {start_ep} (Epsilon: {self.epsilon:.4f})", flush=True)
+            return start_ep
+        return 0
+
+def train(env, agent, episodes=70000, max_steps=30, checkpoint_interval=5000):
+    start_ep = agent.load_checkpoint(CHECKPOINT_FILE)
+
+    for ep in range(start_ep, episodes):
         state = env.reset()
         total_reward = 0
 
@@ -160,18 +183,25 @@ def train(env, agent, episodes=70000, max_steps=30):
                 break
 
         agent.decay_epsilon()
+
         if (ep + 1) % 1000 == 0 or ep == episodes - 1:
             print(f"Episode {ep + 1}/{episodes} | Total Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.4f}", flush=True)
 
-def play_walkthrough(env, agent, max_steps=50):
+        if (ep + 1) % checkpoint_interval == 0:
+            agent.save_checkpoint(ep + 1, CHECKPOINT_FILE)
+
+    agent.save_checkpoint(episodes, CHECKPOINT_FILE)
+
+def play_and_save_walkthrough(env, agent, max_steps=50, output_file=WALKTHROUGH_FILE):
     print("\n--- STARTING TRAINED WALKTHROUGH ---\n")
     state = env.reset()
-    print(f"[Initial Observation]: {state}\n")
+    commands = []
     total_reward = 0
 
     for step in range(1, max_steps + 1):
         action_idx = agent.choose_action(state, greedy=True)
         action_str = env.action_space[action_idx]
+        commands.append(action_str)
 
         next_state, reward, done, _ = env.step(action_str)
         total_reward += reward
@@ -183,6 +213,10 @@ def play_walkthrough(env, agent, max_steps=50):
         if done:
             break
 
+    with open(output_file, "w") as f:
+        f.write("\n".join(commands) + "\n")
+
+    print(f"[Info]: Saved {len(commands)} walkthrough commands to {output_file}")
     print(f"Walkthrough Finished | Cumulative Reward: {total_reward:.2f}\n")
 
 if __name__ == "__main__":
@@ -195,6 +229,7 @@ if __name__ == "__main__":
     env = FrotzEnv(game_path=args.game_path, frotz_bin=args.frotz_bin)
     agent = TabularQAgent(actions=env.action_space)
 
-    train(env, agent, episodes=args.episodes, max_steps=30)
-    play_walkthrough(env, agent, max_steps=50)
+    train(env, agent, episodes=args.episodes, max_steps=30, checkpoint_interval=5000)
+    play_and_save_walkthrough(env, agent, max_steps=50, output_file=WALKTHROUGH_FILE)
+    
     env.close()
