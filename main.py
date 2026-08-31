@@ -9,7 +9,7 @@ import pexpect
 DEFAULT_GAME_PATH = Path.home() / "Games" / "ZCode" / "advent.z5"
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 CHECKPOINT_FILE = "q_checkpoint.json"
-WALKTHROUGH_FILE = "walkthrough_commands.txt"
+WALKTHROUGH_FILE = "walkthrough.txt"
 
 class FrotzEnv:
     def __init__(self, game_path=None, frotz_bin="frotz"):
