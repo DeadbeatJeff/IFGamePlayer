@@ -163,7 +163,7 @@ class TabularQAgent:
             return start_ep
         return 0
 
-def train(env, agent, episodes=70000, max_steps=30, checkpoint_interval=5000):
+def train(env, agent, episodes=210000, max_steps=30, checkpoint_interval=5000):
     start_ep = agent.load_checkpoint(CHECKPOINT_FILE)
 
     for ep in range(start_ep, episodes):
@@ -223,7 +223,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--game-path", type=str, default=None)
     parser.add_argument("--frotz-bin", type=str, default="frotz")
-    parser.add_argument("--episodes", type=int, default=70000)
+    parser.add_argument("--episodes", type=int, default=210000)
     args = parser.parse_args()
 
     env = FrotzEnv(game_path=args.game_path, frotz_bin=args.frotz_bin)
