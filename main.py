@@ -108,7 +108,7 @@ class FrotzEnv:
             self.child.close()
 
 class TabularQAgent:
-    def __init__(self, actions, alpha=0.1, gamma=0.99, epsilon=1.0, epsilon_decay=0.99995, epsilon_min=0.01):
+    def __init__(self, actions, alpha=0.1, gamma=0.99, epsilon=0.1, epsilon_decay=0.99995, epsilon_min=0.001):
         self.actions = actions
         self.alpha = alpha
         self.gamma = gamma
@@ -157,7 +157,7 @@ class TabularQAgent:
             with open(path, 'r') as f:
                 data = json.load(f)
             self.q_table = data.get('q_table', {})
-            self.epsilon = data.get('epsilon', self.epsilon)
+            self.epsilon = min(data.get('epsilon', self.epsilon), self.epsilon)
             start_ep = data.get('episode', 0)
             print(f"[Info]: Resuming from episode {start_ep} (Epsilon: {self.epsilon:.4f})", flush=True)
             return start_ep
