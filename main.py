@@ -283,7 +283,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--game-path", type=str, default=None)
     parser.add_argument("--frotz-bin", type=str, default="frotz")
-    parser.add_argument("--episodes", type=int, default=210000)
+    parser.add_argument("--episodes", type=int, default=500000)
     args = parser.parse_args()
 
     env = FrotzEnv(game_path=args.game_path, frotz_bin=args.frotz_bin)
