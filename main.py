@@ -11,6 +11,26 @@ ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 CHECKPOINT_FILE = "q_checkpoint.json"
 WALKTHROUGH_FILE = "walkthrough.txt"
 
+BASE_ACTIONS = [
+    "look", "inventory", "north", "south", "east", "west",
+    "up", "down", "in", "out", "take all", "drop all",
+    "open door", "examine lamp", "take lamp", "light lamp"
+]
+ACTION_VERBS = (
+    "take", "get", "drop", "open", "close", "examine", "read",
+    "light", "extinguish", "unlock", "lock", "eat", "drink", "fill",
+    "pour", "wave", "rub", "feed", "attack", "kill", "throw", "wear",
+    "remove", "move", "turn on", "turn off"
+)
+GAME_NOUNS = (
+    "lamp", "lantern", "keys", "key", "food", "bottle", "water", "oil",
+    "grate", "door", "cage", "bird", "rod", "pillow", "snake", "fissure",
+    "bridge", "clam", "oyster", "magazine", "dwarf", "dwarves", "pirate",
+    "dragon", "bear", "eggs", "vase", "coins", "diamonds", "silver", "gold",
+    "jewelry", "spices", "chain", "axe", "troll", "plant", "beanstalk",
+    "batteries", "carpet", "sign", "message", "mirror", "helmet", "statue"
+)
+
 class FrotzEnv:
     def __init__(self, game_path=None, frotz_bin="frotz"):
         self.frotz_bin = shutil.which(frotz_bin) or frotz_bin
@@ -18,12 +38,29 @@ class FrotzEnv:
             raise FileNotFoundError(f"Frotz executable '{frotz_bin}' was not found.")
         self.game_path = self._resolve_game_path(game_path)
         self.child = None
+        self._recent_nouns = []
 
-        self.action_space = [
-            "look", "inventory", "north", "south", "east", "west",
-            "up", "down", "in", "out", "take all", "drop all",
-            "open door", "examine lamp", "take lamp", "light lamp"
+        self.action_space = list(BASE_ACTIONS)
+
+    def action_space_for(self, observation):
+        """Return base commands plus verb-noun pairs named in the observation."""
+        observation = observation or ""
+        visible_nouns = [
+            noun for noun in GAME_NOUNS
+            if re.search(rf"\b{re.escape(noun)}\b", observation, re.IGNORECASE)
         ]
+        for noun in visible_nouns:
+            if noun in self._recent_nouns:
+                self._recent_nouns.remove(noun)
+            self._recent_nouns.append(noun)
+        self._recent_nouns = self._recent_nouns[-12:]
+        actions = list(self.action_space)
+        actions.extend(
+            f"{verb} {noun}"
+            for noun in self._recent_nouns
+            for verb in ACTION_VERBS
+        )
+        return list(dict.fromkeys(actions))
 
     def _resolve_game_path(self, game_path=None):
         candidates = []
@@ -47,6 +84,7 @@ class FrotzEnv:
         if self.child and self.child.isalive():
             self.child.close()
 
+        self._recent_nouns = []
         self.child = pexpect.spawn(
             self.frotz_bin, 
             ["-p", "-q", self.game_path], 
@@ -119,25 +157,35 @@ class TabularQAgent:
 
     def get_q_values(self, state):
         if state not in self.q_table:
-            self.q_table[state] = [0.0] * len(self.actions)
+            self.q_table[state] = {}
         return self.q_table[state]
 
-    def choose_action(self, state, greedy=False):
+    def choose_action(self, state, greedy=False, actions=None):
+        available_actions = actions or self.actions
         q_vals = self.get_q_values(state)
+        for action in available_actions:
+            q_vals.setdefault(action, 0.0)
         if not greedy and random.random() < self.epsilon:
-            return random.randint(0, len(self.actions) - 1)
+            return random.randrange(len(available_actions))
         
-        max_v = max(q_vals)
-        best_indices = [i for i, v in enumerate(q_vals) if v == max_v]
+        available_values = [q_vals[action] for action in available_actions]
+        max_v = max(available_values)
+        best_indices = [i for i, value in enumerate(available_values) if value == max_v]
         return random.choice(best_indices)
 
-    def update(self, state, action, reward, next_state, done):
+    def update(self, state, action, reward, next_state, done, actions=None, next_actions=None):
+        available_actions = actions or self.actions
+        action_name = available_actions[action] if isinstance(action, int) else action
         q_vals = self.get_q_values(state)
+        q_vals.setdefault(action_name, 0.0)
+        next_available_actions = next_actions or self.actions
         next_q_vals = self.get_q_values(next_state)
+        for next_action in next_available_actions:
+            next_q_vals.setdefault(next_action, 0.0)
         
-        max_next_q = max(next_q_vals) if not done else 0.0
+        max_next_q = max(next_q_vals[action] for action in next_available_actions) if not done else 0.0
         target = reward + self.gamma * max_next_q
-        q_vals[action] += self.alpha * (target - q_vals[action])
+        q_vals[action_name] += self.alpha * (target - q_vals[action_name])
 
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
@@ -156,7 +204,16 @@ class TabularQAgent:
         if Path(path).exists():
             with open(path, 'r') as f:
                 data = json.load(f)
-            self.q_table = data.get('q_table', {})
+            saved_q_table = data.get('q_table', {})
+            self.q_table = {}
+            for state, values in saved_q_table.items():
+                if isinstance(values, list):
+                    self.q_table[state] = {
+                        action: value
+                        for action, value in zip(self.actions, values)
+                    }
+                else:
+                    self.q_table[state] = values
             self.epsilon = min(data.get('epsilon', self.epsilon), self.epsilon)
             start_ep = data.get('episode', 0)
             print(f"[Info]: Resuming from episode {start_ep} (Epsilon: {self.epsilon:.4f})", flush=True)
@@ -171,11 +228,13 @@ def train(env, agent, episodes=210000, max_steps=30, checkpoint_interval=5000):
         total_reward = 0
 
         for step in range(max_steps):
-            action_idx = agent.choose_action(state)
-            action_str = env.action_space[action_idx]
+            actions = env.action_space_for(state)
+            action_idx = agent.choose_action(state, actions=actions)
+            action_str = actions[action_idx]
             
             next_state, reward, done, _ = env.step(action_str)
-            agent.update(state, action_idx, reward, next_state, done)
+            next_actions = env.action_space_for(next_state)
+            agent.update(state, action_str, reward, next_state, done, actions, next_actions)
             
             state = next_state
             total_reward += reward
@@ -199,8 +258,9 @@ def play_and_save_walkthrough(env, agent, max_steps=50, output_file=WALKTHROUGH_
     total_reward = 0
 
     for step in range(1, max_steps + 1):
-        action_idx = agent.choose_action(state, greedy=True)
-        action_str = env.action_space[action_idx]
+        actions = env.action_space_for(state)
+        action_idx = agent.choose_action(state, greedy=True, actions=actions)
+        action_str = actions[action_idx]
         commands.append(action_str)
 
         next_state, reward, done, _ = env.step(action_str)
