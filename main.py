@@ -108,7 +108,7 @@ class FrotzEnv:
             self.child.close()
 
 class TabularQAgent:
-    def __init__(self, actions, alpha=0.1, gamma=0.99, epsilon=0.1, epsilon_decay=0.99995, epsilon_min=0.001):
+    def __init__(self, actions, alpha=0.1, gamma=0.99, epsilon=0.5, epsilon_decay=0.99995, epsilon_min=0.001):
         self.actions = actions
         self.alpha = alpha
         self.gamma = gamma
