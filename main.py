@@ -17,6 +17,9 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple, Any
 
+# Regex to strip terminal/ANSI escape sequences from raw stdout
+ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
 # =====================================================================
 # 1. DATA STRUCTURES & GRAPH REPRESENTATION
 # =====================================================================
@@ -224,15 +227,12 @@ class ADVENTParser:
         "would you like instructions",
         "somewhere nearby is colossal cave",
         "in the general direction",
-        "are you sure you want to quit",
-        "you don't",
-        "you can't",
-        "i don't"
+        "are you sure you want to quit"
     ]
 
     @staticmethod
     def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.5) -> str:
-        """Reads process stdout until prompt '>' or timeout."""
+        """Reads stdout from the child process until prompt '>' or timeout."""
         output = ""
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -244,12 +244,12 @@ class ADVENTParser:
                 output += char
                 if output.endswith("> "):
                     break
-        return output
+        return ANSI_ESCAPE.sub('', output)
 
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
-        raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
-        clean_lines = [l for l in raw_lines if not l.startswith(">")]
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        clean_lines = [l for l in lines if not l.startswith(">")]
         
         if not clean_lines:
             return "Unknown Area", [], set(), True
@@ -257,18 +257,31 @@ class ADVENTParser:
         lower_text = text.lower()
         is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
 
-        room_title = "Unknown Area"
+        room_title = None
+
+        # Pass 1: Look for short line without standard trailing punctuation or noisy intros
         for line in clean_lines:
             line_lower = line.lower()
-            
-            # Skip noise, prompts, and sentences with end punctuation
             if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
                 continue
             if line.endswith(".") or line.endswith("!") or line.endswith("?"):
                 continue
-            if len(line) < 55:
-                room_title = line.strip()
+            if len(line) < 60:
+                room_title = line
                 break
+
+        # Pass 2: Fall back to first non-ignored line if Pass 1 yielded no title
+        if not room_title:
+            for line in clean_lines:
+                line_lower = line.lower()
+                if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
+                    continue
+                room_title = line[:50]
+                break
+
+        # Ultimate fallback
+        if not room_title:
+            room_title = clean_lines[0][:50]
 
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
@@ -440,7 +453,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_signal)
 
     print(f"============================================================")
-    print(f" IFGamePlayer v2.8 - Integrated Dynamic Agent Engine")
+    print(f" IFGamePlayer v2.9 - Integrated Dynamic Agent Engine")
     print(f" Command Target    : {' '.join(EXECUTABLE)}")
     print(f" Loaded Rooms      : {len(agent.graph.nodes)}")
     print(f" Walkthrough File  : walkthrough.txt")
