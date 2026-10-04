@@ -177,13 +177,41 @@ class JerichoAgent:
         self.episode_visits: Dict[str, int] = {}
         self.last_action: Optional[str] = None
 
+
+    def extract_room_title(observation_text):
+        """
+        Parses the room title from the Z-Machine observation string.
+        Colossal Cave Adventure headers typically appear at the start of
+        the text output (e.g. 'At End Of Road', 'Inside Building', etc.).
+        """
+        if not observation_text:
+            return "Unknown Area"
+        
+        # Clean up excess newlines and leading banner fluff
+        lines = [line.strip() for line in observation_text.strip().split('\n') if line.strip()]
+        
+        for line in lines:
+            # Ignore initial splash header lines
+            if "Welcome to Adventure" in line or "Interactive Original" in line or "Release" in line:
+                continue
+            # Standard location descriptions start without punctuation or actions
+            if len(line) < 60 and not line.endswith('.'):
+                return line
+                
+        # Fallback to the first non-empty line
+        return lines[0][:40] if lines else "Unknown Area"
+
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
         # Query RAM directly for player location and surrounding objects
         
         try:
             player_loc = env.get_player_location()
+            if player_loc is None:
+                player_loc = extract_room_title(obs)
+            else:
+                player_loc = player_loc.name
         except (AttributeError, ValueError):
-            player_loc = None
+            player_loc = extract_room_title(obs)
 
         if player_loc:
             room_title = player_loc.name
