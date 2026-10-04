@@ -1,2 +1,5 @@
-# No third-party Python packages are required for the current main.py.
-# This script uses only the Python standard library.
+# Runtime dependency for the Jericho-backed IF environment
+jericho>=1.0.0
+
+# System package required by the game runtime:
+# Ubuntu/Debian: sudo apt install -y frotz
