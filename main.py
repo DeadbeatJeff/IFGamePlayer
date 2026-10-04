@@ -1,295 +1,325 @@
+#!/usr/bin/env python3
+"""
+IFGamePlayer - Graph-Augmented Agent for Interactive Fiction (ADVENT / Colossal Cave)
+Runs natively using Python Standard Library (compatible with NetBSD / BSD / Linux on sdf.org).
+"""
+
+import hashlib
+import json
+import os
 import re
 import random
-import argparse
-import json
-from pathlib import Path
-import shutil
-import pexpect
+import signal
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Set, Tuple, Any
 
-DEFAULT_GAME_PATH = Path.home() / "Games" / "ZCode" / "advent.z5"
-ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-CHECKPOINT_FILE = "q_checkpoint.json"
-WALKTHROUGH_FILE = "walkthrough.txt"
+# =====================================================================
+# 1. GRAPH & STATE REPRESENTATION
+# =====================================================================
 
-BASE_ACTIONS = [
-    "look", "inventory", "north", "south", "east", "west",
-    "up", "down", "in", "out", "take all", "drop all",
-    "open door", "examine lamp", "take lamp", "light lamp"
-]
-ACTION_VERBS = (
-    "take", "get", "drop", "open", "close", "examine", "read",
-    "light", "extinguish", "unlock", "lock", "eat", "drink", "fill",
-    "pour", "wave", "rub", "feed", "attack", "kill", "throw", "wear",
-    "remove", "move", "turn on", "turn off"
-)
-GAME_NOUNS = (
-    "lamp", "lantern", "keys", "key", "food", "bottle", "water", "oil",
-    "grate", "door", "cage", "bird", "rod", "pillow", "snake", "fissure",
-    "bridge", "clam", "oyster", "magazine", "dwarf", "dwarves", "pirate",
-    "dragon", "bear", "eggs", "vase", "coins", "diamonds", "silver", "gold",
-    "jewelry", "spices", "chain", "axe", "troll", "plant", "beanstalk",
-    "batteries", "carpet", "sign", "message", "mirror", "helmet", "statue"
-)
+class RoomNode:
+    def __init__(self, room_id: str, description: str):
+        self.room_id = room_id
+        self.description = description
+        self.items: Set[str] = set()
+        self.exits: Dict[str, str] = {}  # {action: target_room_id}
+        self.lifetime_visits: int = 0
 
-class FrotzEnv:
-    def __init__(self, game_path=None, frotz_bin="frotz"):
-        self.frotz_bin = shutil.which(frotz_bin) or frotz_bin
-        if not shutil.which(frotz_bin) and not Path(frotz_bin).exists():
-            raise FileNotFoundError(f"Frotz executable '{frotz_bin}' was not found.")
-        self.game_path = self._resolve_game_path(game_path)
-        self.child = None
-        self._recent_nouns = []
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "room_id": self.room_id,
+            "description": self.description,
+            "items": sorted(list(self.items)),
+            "exits": self.exits,
+            "lifetime_visits": self.lifetime_visits,
+        }
 
-        self.action_space = list(BASE_ACTIONS)
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "RoomNode":
+        node = cls(room_id=data["room_id"], description=data.get("description", ""))
+        node.items = set(data.get("items", []))
+        node.exits = data.get("exits", {})
+        node.lifetime_visits = data.get("lifetime_visits", 0)
+        return node
 
-    def action_space_for(self, observation):
-        """Return base commands plus verb-noun pairs named in the observation."""
-        observation = observation or ""
-        visible_nouns = [
-            noun for noun in GAME_NOUNS
-            if re.search(rf"\b{re.escape(noun)}\b", observation, re.IGNORECASE)
-        ]
-        for noun in visible_nouns:
-            if noun in self._recent_nouns:
-                self._recent_nouns.remove(noun)
-            self._recent_nouns.append(noun)
-        self._recent_nouns = self._recent_nouns[-12:]
-        actions = list(self.action_space)
-        actions.extend(
-            f"{verb} {noun}"
-            for noun in self._recent_nouns
-            for verb in ACTION_VERBS
-        )
-        return list(dict.fromkeys(actions))
 
-    def _resolve_game_path(self, game_path=None):
-        candidates = []
-        if game_path is not None:
-            candidates.append(Path(game_path))
-        else:
-            candidates.append(DEFAULT_GAME_PATH)
+class WorldGraph:
+    def __init__(self):
+        self.nodes: Dict[str, RoomNode] = {}
+        self.current_room_id: Optional[str] = None
+        self.inventory: Set[str] = set()
 
-        for name in ["advent.z5", "Advent.z5", "advent.z8", "Advent.z8"]:
-            candidates.append(Path.home() / "Games" / "ZCode" / name)
-            candidates.append(Path.cwd() / name)
+    def get_or_create_node(self, room_id: str, description: str) -> RoomNode:
+        if room_id not in self.nodes:
+            self.nodes[room_id] = RoomNode(room_id, description)
+        return self.nodes[room_id]
 
-        for candidate in candidates:
-            resolved = candidate.expanduser().resolve()
-            if resolved.is_file():
-                return str(resolved)
+    def add_transition(self, from_id: str, action: str, to_id: str):
+        if from_id in self.nodes:
+            self.nodes[from_id].exits[action] = to_id
 
-        raise FileNotFoundError(f"No Z-machine game file found at {DEFAULT_GAME_PATH} or alternative candidates.")
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "current_room_id": self.current_room_id,
+            "inventory": sorted(list(self.inventory)),
+            "nodes": {nid: node.to_dict() for nid, node in self.nodes.items()},
+        }
 
-    def reset(self):
-        if self.child and self.child.isalive():
-            self.child.close()
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "WorldGraph":
+        graph = cls()
+        graph.current_room_id = data.get("current_room_id")
+        graph.inventory = set(data.get("inventory", []))
+        nodes_data = data.get("nodes", {})
+        for nid, ndict in nodes_data.items():
+            graph.nodes[nid] = RoomNode.from_dict(ndict)
+        return graph
 
-        self._recent_nouns = []
-        self.child = pexpect.spawn(
-            self.frotz_bin, 
-            ["-p", "-q", self.game_path], 
-            encoding='utf-8', 
-            dimensions=(24, 80),
-            timeout=2
-        )
-        self._wait_for_prompt()
-        return self._clean_text(self.child.before)
 
-    def _wait_for_prompt(self):
+# =====================================================================
+# 2. DISK SERIALIZATION & STORAGE
+# =====================================================================
+
+class GraphStorage:
+    @staticmethod
+    def save_graph(graph: WorldGraph, filepath: str) -> None:
+        temp_path = f"{filepath}.tmp"
         try:
-            self.child.expect([r'>', pexpect.TIMEOUT], timeout=1.0)
-        except pexpect.EOF:
-            pass
+            with open(temp_path, "w", encoding="utf-8") as f:
+                json.dump(graph.to_dict(), f, indent=2)
+            os.replace(temp_path, filepath)
+            print(f"[Storage] Graph saved successfully ({len(graph.nodes)} rooms mapped).")
+        except Exception as e:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            print(f"[Storage] Save failed: {e}")
 
-    def step(self, action_str):
-        if not self.child or not self.child.isalive():
-            raise RuntimeError("Environment not initialized.")
-
-        self.child.sendline(action_str)
-        self._wait_for_prompt()
-        output = self._clean_text(self.child.before)
-
-        score = self._get_score()
-        reward = float(score) - getattr(self, 'last_score', 0)
-        self.last_score = score
-        if reward == 0:
-            reward = -0.01
-
-        done = False
-        if "you have died" in output.lower() or "you win" in output.lower():
-            done = True
-
-        return output, reward, done, {}
-
-    def _get_score(self):
+    @staticmethod
+    def load_graph(filepath: str) -> WorldGraph:
+        if not os.path.exists(filepath):
+            print(f"[Storage] No save file found at '{filepath}'. Starting fresh world graph.")
+            return WorldGraph()
         try:
-            self.child.sendline("score")
-            self._wait_for_prompt()
-            clean = ANSI_ESCAPE.sub('', self.child.before)
-            match = re.search(r'score of (\d+)', clean, re.IGNORECASE)
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            graph = WorldGraph.from_dict(data)
+            print(f"[Storage] Loaded graph with {len(graph.nodes)} mapped rooms from '{filepath}'.")
+            return graph
+        except Exception as e:
+            print(f"[Storage] Failed to read save file ({e}). Starting fresh graph.")
+            return WorldGraph()
+
+
+# =====================================================================
+# 3. TEXT PARSER & ACTION GENERATOR
+# =====================================================================
+
+class ADVENTParser:
+    CARDINAL_DIRECTIONS = [
+        "north", "south", "east", "west", 
+        "ne", "nw", "se", "sw", 
+        "up", "down", "in", "out", "enter", "exit", "climb"
+    ]
+    
+    COMMON_VERBS = ["take", "drop", "look", "inventory", "examine", "open", "unlock"]
+
+    @staticmethod
+    def parse_stdout(text: str) -> Tuple[str, List[str], Set[str]]:
+        clean_lines = [line.strip() for line in text.split("\n") if line.strip()]
+        if not clean_lines:
+            return "Unknown Area", [], set()
+
+        room_title = clean_lines[0]
+        items_found = set()
+        
+        # Regex heuristics for standard IF item placement text
+        item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
+        for line in clean_lines:
+            match = item_regex.search(line)
             if match:
-                return int(match.group(1))
-        except Exception:
-            pass
-        return 0
+                items_found.add(match.group(1).lower().strip())
 
-    def _clean_text(self, text):
-        if not text:
-            return ""
-        clean = ANSI_ESCAPE.sub('', text)
-        lines = clean.splitlines()
-        cleaned = [l.strip() for l in lines if l.strip() and not l.strip().startswith('>')]
-        return " ".join(cleaned)
+        return room_title, clean_lines, items_found
+
+    @staticmethod
+    def generate_room_id(title: str, history: List[str]) -> str:
+        clean_title = title.strip().lower()
+        # Handle maze rooms with identical descriptions by scoping hash with trajectory
+        if any(w in clean_title for w in ["maze", "alike", "different"]):
+            context = "->".join(history[-4:]) if history else "start"
+            raw_key = f"{clean_title}|{context}"
+        else:
+            raw_key = clean_title
+        return hashlib.md5(raw_key.encode("utf-8")).hexdigest()[:10]
+
+
+# =====================================================================
+# 4. AGENT LOGIC & INTRINSIC EXPLORATION
+# =====================================================================
+
+class GraphAgent:
+    def __init__(self, save_path: str = "advent_world_graph.json", autosave_steps: int = 25):
+        self.save_path = save_path
+        self.autosave_steps = autosave_steps
+        self.step_counter = 0
+
+        self.graph = GraphStorage.load_graph(self.save_path)
+        
+        # Reset per-session state (retaining cumulative mapped nodes)
+        self.graph.current_room_id = None
+        self.history_path: List[str] = []
+        self.episode_visits: Dict[str, int] = {}
+        self.last_action: Optional[str] = None
+
+    def process_step(self, stdout_text: str) -> str:
+        self.step_counter += 1
+        room_title, _, items = ADVENTParser.parse_stdout(stdout_text)
+        
+        # 1. State Identification
+        room_id = ADVENTParser.generate_room_id(room_title, self.history_path)
+        node = self.graph.get_or_create_node(room_id, room_title)
+        node.items.update(items)
+        node.lifetime_visits += 1
+        self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
+
+        # 2. Update Graph Transition Edge
+        if self.graph.current_room_id and self.last_action:
+            self.graph.add_transition(
+                from_id=self.graph.current_room_id,
+                action=self.last_action,
+                to_id=room_id
+            )
+
+        self.graph.current_room_id = room_id
+
+        # 3. Action Selection Strategy
+        action = self._select_intrinsic_action(node)
+
+        # 4. Bookkeeping
+        self.last_action = action
+        if action in ADVENTParser.CARDINAL_DIRECTIONS:
+            self.history_path.append(action)
+
+        if self.step_counter % self.autosave_steps == 0:
+            GraphStorage.save_graph(self.graph, self.save_path)
+
+        return action
+
+    def _select_intrinsic_action(self, node: RoomNode) -> str:
+        # Priority 1: Unexplored directional exits from this room
+        unvisited_dirs = [d for d in ADVENTParser.CARDINAL_DIRECTIONS if d not in node.exits]
+        if unvisited_dirs:
+            return random.choice(unvisited_dirs)
+
+        # Priority 2: Pick items if present and not carrying many
+        if node.items and random.random() < 0.4:
+            item = random.choice(list(node.items))
+            return f"take {item}"
+
+        # Priority 3: Least visited directional edge (Count-based intrinsic drive)
+        known_dirs = list(node.exits.keys())
+        if known_dirs:
+            # Sort directions by target room episode visit count
+            known_dirs.sort(
+                key=lambda d: self.episode_visits.get(node.exits[d], 0)
+            )
+            return known_dirs[0]
+
+        # Fallback
+        return random.choice(ADVENTParser.CARDINAL_DIRECTIONS)
 
     def close(self):
-        if self.child and self.child.isalive():
-            self.child.close()
+        GraphStorage.save_graph(self.graph, self.save_path)
 
-class TabularQAgent:
-    def __init__(self, actions, alpha=0.1, gamma=0.99, epsilon=0.5, epsilon_decay=0.99995, epsilon_min=0.001):
-        self.actions = actions
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
-        self.epsilon_decay = epsilon_decay
-        self.epsilon_min = epsilon_min
-        self.q_table = {}
 
-    def get_q_values(self, state):
-        if state not in self.q_table:
-            self.q_table[state] = {}
-        return self.q_table[state]
+# =====================================================================
+# 5. SUBPROCESS GAME RUNNER & MAIN LOOP
+# =====================================================================
 
-    def choose_action(self, state, greedy=False, actions=None):
-        available_actions = actions or self.actions
-        q_vals = self.get_q_values(state)
-        for action in available_actions:
-            q_vals.setdefault(action, 0.0)
-        if not greedy and random.random() < self.epsilon:
-            return random.randrange(len(available_actions))
-        
-        available_values = [q_vals[action] for action in available_actions]
-        max_v = max(available_values)
-        best_indices = [i for i, value in enumerate(available_values) if value == max_v]
-        return random.choice(best_indices)
+def run_agent_session(game_cmd: List[str], max_steps: int = 200, save_file: str = "advent_world_graph.json"):
+    agent = GraphAgent(save_path=save_file)
 
-    def update(self, state, action, reward, next_state, done, actions=None, next_actions=None):
-        available_actions = actions or self.actions
-        action_name = available_actions[action] if isinstance(action, int) else action
-        q_vals = self.get_q_values(state)
-        q_vals.setdefault(action_name, 0.0)
-        next_available_actions = next_actions or self.actions
-        next_q_vals = self.get_q_values(next_state)
-        for next_action in next_available_actions:
-            next_q_vals.setdefault(next_action, 0.0)
-        
-        max_next_q = max(next_q_vals[action] for action in next_available_actions) if not done else 0.0
-        target = reward + self.gamma * max_next_q
-        q_vals[action_name] += self.alpha * (target - q_vals[action_name])
+    def handle_signal(signum, frame):
+        print("\n[Runner] Interrupted! Saving state before exiting...")
+        agent.close()
+        sys.exit(0)
 
-    def decay_epsilon(self):
-        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
 
-    def save_checkpoint(self, episode, path=CHECKPOINT_FILE):
-        data = {
-            'episode': episode,
-            'epsilon': self.epsilon,
-            'q_table': self.q_table
-        }
-        with open(path, 'w') as f:
-            json.dump(data, f)
-        print(f"[Info]: Saved checkpoint at episode {episode} to {path}", flush=True)
+    print(f"[Runner] Launching game process: {' '.join(game_cmd)}")
+    try:
+        proc = subprocess.Popen(
+            game_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+    except FileNotFoundError:
+        print(f"[Runner] Error: Executable '{game_cmd[0]}' not found. Check system path.")
+        sys.exit(1)
 
-    def load_checkpoint(self, path=CHECKPOINT_FILE):
-        if Path(path).exists():
-            with open(path, 'r') as f:
-                data = json.load(f)
-            saved_q_table = data.get('q_table', {})
-            self.q_table = {}
-            for state, values in saved_q_table.items():
-                if isinstance(values, list):
-                    self.q_table[state] = {
-                        action: value
-                        for action, value in zip(self.actions, values)
-                    }
-                else:
-                    self.q_table[state] = values
-            self.epsilon = min(data.get('epsilon', self.epsilon), self.epsilon)
-            start_ep = data.get('episode', 0)
-            print(f"[Info]: Resuming from episode {start_ep} (Epsilon: {self.epsilon:.4f})", flush=True)
-            return start_ep
-        return 0
-
-def train(env, agent, episodes=210000, max_steps=30, checkpoint_interval=5000):
-    start_ep = agent.load_checkpoint(CHECKPOINT_FILE)
-
-    for ep in range(start_ep, episodes):
-        state = env.reset()
-        total_reward = 0
-
-        for step in range(max_steps):
-            actions = env.action_space_for(state)
-            action_idx = agent.choose_action(state, actions=actions)
-            action_str = actions[action_idx]
-            
-            next_state, reward, done, _ = env.step(action_str)
-            next_actions = env.action_space_for(next_state)
-            agent.update(state, action_str, reward, next_state, done, actions, next_actions)
-            
-            state = next_state
-            total_reward += reward
-            if done:
-                break
-
-        agent.decay_epsilon()
-
-        if (ep + 1) % 1000 == 0 or ep == episodes - 1:
-            print(f"Episode {ep + 1}/{episodes} | Total Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.4f}", flush=True)
-
-        if (ep + 1) % checkpoint_interval == 0:
-            agent.save_checkpoint(ep + 1, CHECKPOINT_FILE)
-
-    agent.save_checkpoint(episodes, CHECKPOINT_FILE)
-
-def play_and_save_walkthrough(env, agent, max_steps=50, output_file=WALKTHROUGH_FILE):
-    print("\n--- STARTING TRAINED WALKTHROUGH ---\n")
-    state = env.reset()
-    commands = []
-    total_reward = 0
-
-    for step in range(1, max_steps + 1):
-        actions = env.action_space_for(state)
-        action_idx = agent.choose_action(state, greedy=True, actions=actions)
-        action_str = actions[action_idx]
-        commands.append(action_str)
-
-        next_state, reward, done, _ = env.step(action_str)
-        total_reward += reward
-
-        print(f"Step {step} | Action: '{action_str}' | Reward: {reward:.2f}")
-        print(f"Game Response: {next_state}\n")
-
-        state = next_state
-        if done:
+    time.sleep(0.5)
+    
+    # Read initial greeting / room output
+    initial_output = ""
+    # Non-blocking initial read heuristic
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        initial_output += line
+        if ">" in line or "Welcome" in line or "At end of road" in line:
             break
 
-    with open(output_file, "w") as f:
-        f.write("\n".join(commands) + "\n")
+    print("--- Initial Game Output ---")
+    print(initial_output.strip())
+    print("---------------------------")
 
-    print(f"[Info]: Saved {len(commands)} walkthrough commands to {output_file}")
-    print(f"Walkthrough Finished | Cumulative Reward: {total_reward:.2f}\n")
+    current_stdout = initial_output
+
+    for step in range(1, max_steps + 1):
+        if proc.poll() is not None:
+            print("[Runner] Game process ended unexpectedly.")
+            break
+
+        action = agent.process_step(current_stdout)
+        print(f"Step {step}/{max_steps} | Room: {agent.graph.current_room_id} | Action -> '{action}'")
+
+        # Send action to game process
+        proc.stdin.write(action + "\n")
+        proc.stdin.flush()
+
+        # Capture response
+        current_stdout = ""
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            current_stdout += line
+            # Break reading loop on prompt symbol or newline timeout
+            if ">" in line or line.strip().endswith(":"):
+                break
+
+    print("[Runner] Max steps reached. Terminating session.")
+    proc.terminate()
+    agent.close()
+
+# =====================================================================
+# ENTRY POINT
+# =====================================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--game-path", type=str, default=None)
-    parser.add_argument("--frotz-bin", type=str, default="frotz")
-    parser.add_argument("--episodes", type=int, default=500000)
-    args = parser.parse_args()
+    # Adjust game executable path for your sdf environment (e.g., 'advent', 'glulxe', or custom binary path)
+    EXECUTABLE = ["advent"] 
+    MAX_STEPS = 150
+    SAVE_PATH = "advent_world_graph.json"
 
-    env = FrotzEnv(game_path=args.game_path, frotz_bin=args.frotz_bin)
-    agent = TabularQAgent(actions=env.action_space)
+    if len(sys.argv) > 1:
+        EXECUTABLE = [sys.argv[1]]
 
-    train(env, agent, episodes=args.episodes, max_steps=30, checkpoint_interval=5000)
-    play_and_save_walkthrough(env, agent, max_steps=50, output_file=WALKTHROUGH_FILE)
-    
-    env.close()
+    run_agent_session(game_cmd=EXECUTABLE, max_steps=MAX_STEPS, save_file=SAVE_PATH)
