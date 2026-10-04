@@ -170,73 +170,66 @@ class EpisodeLogger:
 # =====================================================================
 
 class ADVENTParser:
-    CARDINAL_DIRECTIONS = [
-        "north", "south", "east", "west", 
-        "ne", "nw", "se", "sw", 
-        "up", "down", "in", "out", "enter", "exit", "climb"
+    # Exact known room header matches for Colossal Cave (135/350-point Advent)
+    # Standard headers in Frotz BRIEF mode are always short and unpunctuated.
+    KNOWN_LOCATIONS = {
+        "at end of road", "at hill in road", "inside building", 
+        "in valley", "at slit in streambed", "outside grate", 
+        "below grate", "in cobble crawl", "in debris room", 
+        "in canyon above room", "in bird chamber", "at pit",
+        "in hall of mists", "in hall of mountain king", "in open forest",
+        "in forest", "at brink of pit", "in mirror room", "in cave passage"
+    }
+
+    NO_OP_PHRASES = [
+        "you can't go that way", "there is no way", "i don't understand",
+        "nothing happens", "you can't", "i don't know how", "pitch dark"
     ]
-
-    # Expanded rejection list for narrative chatter and engine responses
-    IGNORE_PREFIXES = (
-        "welcome", "would you", "somewhere nearby", "are you sure",
-        "you can't", "you cannot", "there is no way", "i don't",
-        "i do", "in the general", "there are some", "ok", "you'r",
-        "around you", "you are in"
-    )
-
-    @staticmethod
-    def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.3) -> str:
-        import fcntl
-        fd = proc.stdout.fileno()
-        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
-
-        output = ""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                chunk = proc.stdout.read(1024)
-                if chunk:
-                    output += chunk
-                    if ">" in chunk:
-                        break
-                else:
-                    time.sleep(0.01)
-            except (IOError, TypeError):
-                time.sleep(0.01)
-
-        return ANSI_ESCAPE.sub('', output)
 
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
         raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
-        clean_lines = [l for l in raw_lines if not l.startswith(">") and l.lower() not in ["ok", "ok."]]
+        clean_lines = [
+            l for l in raw_lines 
+            if not l.startswith(">") and l.lower() not in ["ok", "ok."]
+        ]
 
         lower_text = text.lower()
-        is_noop = any(phrase in lower_text for phrase in [
-            "you can't", "nothing happens", "i don't understand", "no way to go"
-        ])
+        is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
 
         if not clean_lines:
             return "At End Of Road", [], set(), is_noop
 
         room_title = None
 
-        # Look for a short line (<35 chars) that doesn't start with known error/narrative prefixes
+        # 1. Match against known exact location headers if available
         for line in clean_lines:
-            line_l = line.lower()
-            if any(line_l.startswith(prefix) for prefix in ADVENTParser.IGNORE_PREFIXES):
-                continue
-            
-            # True Z-machine headers are short, capitalized title phrases without sentence punctuation
-            if len(line) < 35 and not line.endswith(".") and not line.endswith("!") and not line.endswith("?"):
+            if line.lower() in ADVENTParser.KNOWN_LOCATIONS:
+                room_title = line
+                break
+
+        # 2. Heuristic fallback: Strict criteria for unknown rooms
+        if not room_title:
+            for line in clean_lines:
+                line_lower = line.lower()
+                
+                # Filter out item placement descriptions ("There is a...", "There are...")
+                if line_lower.startswith("there is") or line_lower.startswith("there are"):
+                    continue
+                # Filter out direction echoes or response chatter
+                if line_lower in ["north", "south", "east", "west", "up", "down", "in", "out", "ne", "nw", "se", "sw"]:
+                    continue
+                # Reject lines with periods, exclamation marks, or length > 30
+                if line.endswith(".") or line.endswith("!") or line.endswith("?") or len(line) > 30:
+                    continue
+
                 room_title = line
                 break
 
         if not room_title:
             room_title = "At End Of Road"
 
-        # Item detection (only parse actual floor items, ignore inventory)
+        # Item detection (extract room-bound items only)
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
         for line in clean_lines:
@@ -245,16 +238,6 @@ class ADVENTParser:
                 items_found.add(match.group(1).lower().strip())
 
         return room_title, clean_lines, items_found, is_noop
-
-    @staticmethod
-    def generate_room_id(title: str, history: List[str]) -> str:
-        clean_title = title.strip().lower()
-        if any(w in clean_title for w in ["maze", "alike", "different"]):
-            context = "->".join(history[-4:]) if history else "start"
-            raw_key = f"{clean_title}|{context}"
-        else:
-            raw_key = clean_title
-        return hashlib.md5(raw_key.encode("utf-8")).hexdigest()[:10]
 
 
 # =====================================================================
