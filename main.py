@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 IFGamePlayer - Integrated Single-File Game Engine & Map Analyzer
-Combines non-blocking Z-Machine execution, deadlock prevention, graph mapping, 
-walkthrough generation, and map visualization into one unified script.
+Combines non-blocking Z-Machine execution, deadlock prevention, robust title parsing,
+graph mapping, walkthrough generation, and map visualization into one unified script.
 """
 
 import hashlib
@@ -213,7 +213,8 @@ class ADVENTParser:
         "pitch dark",
         "you can't",
         "ok",
-        "i don't understand"
+        "i don't understand",
+        "already have"
     ]
 
     IGNORE_HEADERS = [
@@ -221,11 +222,14 @@ class ADVENTParser:
         "would you like instructions",
         "somewhere nearby is colossal cave",
         "in the general direction",
-        "unknown area"
+        "unknown area",
+        "at end of road",
+        "are you sure you want to quit"
     ]
 
     @staticmethod
-    def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.2) -> str:
+    def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.15) -> str:
+        """Reads process stdout without blocking indefinitely."""
         output = ""
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -253,16 +257,21 @@ class ADVENTParser:
         lower_text = text.lower()
         is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
 
-        # Look for the first line that looks like a legitimate room header
+        # Select candidate room header line
         room_title = "Unknown Area"
         for line in clean_lines:
             line_lower = line.lower()
             if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_HEADERS):
                 continue
-            # Room titles in Adventure are short and usually lack sentence-ending punctuation
             if len(line) < 60 and not line.endswith("."):
                 room_title = line
                 break
+
+        if room_title == "Unknown Area" and clean_lines:
+            # Fallback for valid non-standard room titles
+            first_line = clean_lines[0]
+            if len(first_line) < 50 and not first_line.endswith("."):
+                room_title = first_line
 
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
@@ -342,9 +351,10 @@ class GraphAgent:
         if unvisited_dirs:
             return random.choice(unvisited_dirs)
 
-        # 3. Take visible items opportunistically
-        if node.items and random.random() < 0.35:
-            item = random.choice(list(node.items))
+        # 3. Take visible items opportunistically (ONLY if take action isn't blocked)
+        untried_items = [i for i in node.items if f"take {i}" not in node.blocked_actions]
+        if untried_items and random.random() < 0.15:
+            item = random.choice(untried_items)
             return f"take {item}"
 
         # 4. Count-based traversal to least-visited neighbor
@@ -411,13 +421,13 @@ def run_agent_session(game_cmd: List[str], agent: GraphAgent, max_steps: int = 3
 
 
 if __name__ == "__main__":
-    # If passed `--view`, print map summary and exit
+    # Summary Viewer Flag
     if "--view" in sys.argv or "-v" in sys.argv:
         graph = GraphStorage.load_graph("advent_world_graph.json")
         graph.print_summary()
         sys.exit(0)
 
-    # Determine default executable
+    # Executable resolution
     EXECUTABLE = ["dfrotz", "advent.z5"] if os.path.exists("advent.z5") else ["advent"]
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         EXECUTABLE = sys.argv[1:]
@@ -439,7 +449,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_signal)
 
     print(f"============================================================")
-    print(f" IFGamePlayer v2.5 - Dynamic Epsilon Exploration Engine")
+    print(f" IFGamePlayer v2.6 - Integrated Dynamic Agent Engine")
     print(f" Command Target    : {' '.join(EXECUTABLE)}")
     print(f" Loaded Rooms      : {len(agent.graph.nodes)}")
     print(f" Walkthrough File  : walkthrough.txt")
