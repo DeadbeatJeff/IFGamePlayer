@@ -18,6 +18,23 @@ except ImportError:
     print("[Error] Jericho is not installed. Run: pip install jericho")
     sys.exit(1)
 
+def extract_room_title(observation_text):
+        """
+        Parses the room title from the Z-Machine observation string.
+        """
+        if not observation_text:
+            return "Unknown Area"
+        
+        lines = [line.strip() for line in observation_text.strip().split('\n') if line.strip()]
+        
+        for line in lines:
+            if "Welcome to Adventure" in line or "Interactive Original" in line or "Release" in line:
+                continue
+            if len(line) < 60 and not line.endswith('.'):
+                return line
+                
+        return lines[0][:40] if lines else "Unknown Area"
+
 
 # =====================================================================
 # 1. DATA STRUCTURES & GRAPH REPRESENTATION
@@ -176,24 +193,6 @@ class JerichoAgent:
         self.graph = GraphStorage.load_graph(self.save_path)
         self.episode_visits: Dict[str, int] = {}
         self.last_action: Optional[str] = None
-
-
-    def extract_room_title(observation_text):
-        """
-        Parses the room title from the Z-Machine observation string.
-        """
-        if not observation_text:
-            return "Unknown Area"
-        
-        lines = [line.strip() for line in observation_text.strip().split('\n') if line.strip()]
-        
-        for line in lines:
-            if "Welcome to Adventure" in line or "Interactive Original" in line or "Release" in line:
-                continue
-            if len(line) < 60 and not line.endswith('.'):
-                return line
-                
-        return lines[0][:40] if lines else "Unknown Area"
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
         # Query RAM directly for player location and surrounding objects
