@@ -195,8 +195,7 @@ class JerichoAgent:
         self.last_action: Optional[str] = None
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
-        # Query RAM directly for player location and surrounding objects
-        
+        # Determine room title via RAM or observation text parsing
         try:
             loc_obj = env.get_player_location()
             if loc_obj is not None:
@@ -206,11 +205,15 @@ class JerichoAgent:
         except (AttributeError, ValueError):
             room_title = extract_room_title(observation)
 
+        # Generate unique room_id from room_title (or observation text)
+        room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
+
         node = self.graph.get_or_create_node(room_id, room_title)
 
-        # Retrieve room items directly from Z-Machine object tree
+        # Retrieve room items safely
         try:
-            items = [obj.name for obj in env.get_surrounding_objects() if obj != player_loc]
+            surrounding = env.get_surrounding_objects()
+            items = [obj.name for obj in surrounding if hasattr(obj, "name")]
             node.items.update(items)
         except Exception:
             pass
@@ -232,8 +235,12 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        # Get candidates (Jericho provides valid candidate actions or fallback to directions)
-        valid_actions = env.get_valid_actions()
+        # Get candidate actions
+        try:
+            valid_actions = env.get_valid_actions()
+        except Exception:
+            valid_actions = []
+
         if not valid_actions:
             valid_actions = [a for a in self.CARDINAL_DIRECTIONS if a not in node.blocked_actions]
 
