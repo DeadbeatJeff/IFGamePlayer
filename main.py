@@ -18,30 +18,27 @@ except ImportError:
     print("[Error] Jericho is not installed. Run: pip install jericho")
     sys.exit(1)
 
+REJECTION_PHRASES = (
+    "you can't", "you don't", "you are unable", "what do you", 
+    "i don't think", "welcome to", "interactive original", "release",
+    "the stream flows", "but you aren't", "the pipes are", "you can only go"
+)
+
 def extract_room_title(observation: str) -> str:
-    """
-    Parses the actual room title from the Z-Machine observation string,
-    filtering out command error responses and general descriptive text.
-    """
     if not observation:
-        return "Unknown Area"
+        return ""
 
     lines = [line.strip() for line in observation.strip().split('\n') if line.strip()]
 
-    # Strings indicating game responses rather than true room titles
-    IGNORE_PREFIXES = (
-        "You ", "What ", "I don't ", "The ", "But ", "There is ",
-        "Welcome ", "Release ", "Interactive ", "ADVENTURE"
-    )
-
     for line in lines:
-        # True room titles are concise and don't end in punctuation like '.' or '?'
+        line_lower = line.lower()
+        # Skip error messages, questions, and sentences ending in full punctuation
+        if any(phrase in line_lower for phrase in REJECTION_PHRASES):
+            continue
         if len(line) < 50 and not line.endswith(('.', '?', '!')):
-            if not any(line.startswith(prefix) for prefix in IGNORE_PREFIXES):
-                return line
+            return line
 
-    # Fallback to first line cleaned if no concise title found
-    return lines[0][:40] if lines else "Unknown Area"
+    return ""
 
 
 # =====================================================================
@@ -203,36 +200,32 @@ class JerichoAgent:
         self.last_action: Optional[str] = None
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
-        # Rejection phrases that Jericho/RAM occasionally assigns to location/object names
-        REJECTION_PHRASES = (
-            "You can't", "You don't", "You are unable", "What do you", 
-            "I don't think", "Welcome to", "Interactive Original", "Release",
-            "The stream flows", "But you aren't", "The pipes are"
-        )
+    room_title = None
 
-        # 1. Try RAM location first
-        room_title = None
-        try:
-            loc_obj = env.get_player_location()
-            if loc_obj is not None and hasattr(loc_obj, 'name') and loc_obj.name:
-                title_candidate = loc_obj.name.strip()
-                if not any(phrase in title_candidate for phrase in REJECTION_PHRASES):
-                    room_title = title_candidate
-        except Exception:
-            pass
+    # Try Jericho RAM location
+    try:
+        loc_obj = env.get_player_location()
+        if loc_obj is not None and hasattr(loc_obj, 'name') and loc_obj.name:
+            cand = loc_obj.name.strip()
+            if not any(phrase in cand.lower() for phrase in REJECTION_PHRASES):
+                room_title = cand
+    except Exception:
+        pass
 
-        # 2. Fall back to text observation parsing if RAM returned an error phrase or None
-        if not room_title:
-            room_title = extract_room_title(observation)
+    # Fall back to parser
+    if not room_title:
+        room_title = extract_room_title(observation)
 
-        # 3. Final validation guardrail
-        if any(phrase in room_title for phrase in REJECTION_PHRASES):
-            room_title = "Unknown Area"
+    # Key Guardrail: If no valid room header is detected in the response,
+    # the move failed—stay in the existing room node instead of creating a dummy node.
+    if not room_title:
+        if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
+            room_title = self.graph.nodes[self.graph.current_room_id].title
+        else:
+            room_title = "At End Of Road"  # Default starting room fallback for Adventure
 
-        # Generate unique room_id from room_title
-        room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
-
-        node = self.graph.get_or_create_node(room_id, room_title)
+    room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
+    node = self.graph.get_or_create_node(room_id, room_title)
 
         # Retrieve room items safely
         try:
