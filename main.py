@@ -170,8 +170,6 @@ class EpisodeLogger:
 # =====================================================================
 
 class ADVENTParser:
-    # Exact known room header matches for Colossal Cave (135/350-point Advent)
-    # Standard headers in Frotz BRIEF mode are always short and unpunctuated.
     KNOWN_LOCATIONS = {
         "at end of road", "at hill in road", "inside building", 
         "in valley", "at slit in streambed", "outside grate", 
@@ -185,6 +183,43 @@ class ADVENTParser:
         "you can't go that way", "there is no way", "i don't understand",
         "nothing happens", "you can't", "i don't know how", "pitch dark"
     ]
+
+    CARDINAL_DIRECTIONS = [
+        "north", "south", "east", "west", 
+        "ne", "nw", "se", "sw", 
+        "up", "down", "in", "out", "enter", "exit", "climb"
+    ]
+
+    # Expanded rejection list for narrative chatter and engine responses
+    IGNORE_PREFIXES = (
+        "welcome", "would you", "somewhere nearby", "are you sure",
+        "you can't", "you cannot", "there is no way", "i don't",
+        "i do", "in the general", "there are some", "ok", "you'r",
+        "around you", "you are in"
+    )
+
+    @staticmethod
+    def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.3) -> str:
+        import fcntl
+        fd = proc.stdout.fileno()
+        fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+
+        output = ""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                chunk = proc.stdout.read(1024)
+                if chunk:
+                    output += chunk
+                    if ">" in chunk:
+                        break
+                else:
+                    time.sleep(0.01)
+            except (IOError, TypeError):
+                time.sleep(0.01)
+
+        return ANSI_ESCAPE.sub('', output)
 
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
@@ -238,6 +273,16 @@ class ADVENTParser:
                 items_found.add(match.group(1).lower().strip())
 
         return room_title, clean_lines, items_found, is_noop
+
+    @staticmethod
+    def generate_room_id(title: str, history: List[str]) -> str:
+        clean_title = title.strip().lower()
+        if any(w in clean_title for w in ["maze", "alike", "different"]):
+            context = "->".join(history[-4:]) if history else "start"
+            raw_key = f"{clean_title}|{context}"
+        else:
+            raw_key = clean_title
+        return hashlib.md5(raw_key.encode("utf-8")).hexdigest()[:10]
 
 
 # =====================================================================
