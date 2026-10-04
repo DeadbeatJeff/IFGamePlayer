@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 IFGamePlayer - Integrated Single-File Game Engine & Map Analyzer
-Combines Z-Machine execution, deadlock prevention, robust title parsing,
-graph mapping, walkthrough generation, and map visualization into one unified script.
 """
 
 import hashlib
@@ -17,7 +15,6 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple, Any
 
-# Regex to strip terminal/ANSI escape sequences
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 # =====================================================================
@@ -29,7 +26,7 @@ class RoomNode:
         self.room_id = room_id
         self.description = description
         self.items: Set[str] = set()
-        self.exits: Dict[str, str] = {}  # {action: target_room_id}
+        self.exits: Dict[str, str] = {}
         self.blocked_actions: Set[str] = set()
         self.lifetime_visits: int = 0
 
@@ -62,6 +59,8 @@ class WorldGraph:
     def get_or_create_node(self, room_id: str, description: str) -> RoomNode:
         if room_id not in self.nodes:
             self.nodes[room_id] = RoomNode(room_id, description)
+        elif description and self.nodes[room_id].description in ["At End Of Road", "Unknown Area"]:
+            self.nodes[room_id].description = description
         return self.nodes[room_id]
 
     def add_transition(self, from_id: str, action: str, to_id: str):
@@ -162,7 +161,6 @@ class GraphStorage:
 class EpisodeLogger:
     def __init__(self, log_path: str = "recent_episodes.txt"):
         self.log_path = log_path
-        # Initialize log file with header if it doesn't exist
         if not os.path.exists(self.log_path):
             with open(self.log_path, "w", encoding="utf-8") as f:
                 f.write("=== IFGamePlayer Episode Log ===\n\n")
@@ -170,13 +168,14 @@ class EpisodeLogger:
     def append_episode(self, episode_num: int, steps: int, actions: List[str], final_text: str, rooms_found: int):
         score_match = re.search(r"score\s+(?:of\s+)?(\d+)", final_text, re.IGNORECASE)
         score_str = score_match.group(1) if score_match else "N/A"
-        snippet = final_text.strip().replace("\n", " ")[:150]
+        
+        # Summarize actions concisely to keep file readable with tail
+        action_str = " -> ".join(actions[:20]) + (f" ... [{len(actions)-20} more]" if len(actions) > 20 else "")
 
         try:
             with open(self.log_path, "a", encoding="utf-8") as f:
                 f.write(f"Episode #{episode_num} | Steps: {steps} | Score: {score_str} | Mapped Rooms: {rooms_found}\n")
-                f.write(f"Final Output: {snippet}\n")
-                f.write(f"Command Sequence: {' -> '.join(actions)}\n")
+                f.write(f"Commands: {action_str}\n")
                 f.write("-" * 70 + "\n")
         except Exception as e:
             print(f"[Logger] Failed to write episode log: {e}")
@@ -218,12 +217,12 @@ class ADVENTParser:
     ]
 
     @staticmethod
-    def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.5) -> str:
-        """Reads process stdout until prompt '>' or timeout."""
+    def read_nonblocking(proc: subprocess.Popen, timeout: float = 1.0) -> str:
+        """Reads stdout with an extended timeout to ensure Z-Machine output flushes completely."""
         output = ""
         start_time = time.time()
         while time.time() - start_time < timeout:
-            rlist, _, _ = select.select([proc.stdout], [], [], 0.02)
+            rlist, _, _ = select.select([proc.stdout], [], [], 0.05)
             if rlist:
                 char = proc.stdout.read(1)
                 if not char:
@@ -246,21 +245,25 @@ class ADVENTParser:
 
         room_title = None
 
-        # Filter candidate headers
+        # Direct header match for standard Colossal Cave / Z-Machine headers
         for line in clean_lines:
             line_lower = line.lower()
             if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
                 continue
-            if line.endswith(".") or line.endswith("!") or line.endswith("?"):
-                continue
-            if len(line) < 60:
-                room_title = line
-                break
+            # Header lines usually do not end with punctuation
+            if not line.endswith(".") and not line.endswith("!") and not line.endswith("?"):
+                if len(line) < 50:
+                    room_title = line
+                    break
 
         if not room_title:
-            # Fallback to first line cleaned of non-alpha characters
-            first_valid = [l for l in clean_lines if len(l) > 2]
-            room_title = first_valid[0][:50] if first_valid else "At End Of Road"
+            for line in clean_lines:
+                if len(line) < 60 and not any(ig in line.lower() for ig in ADVENTParser.IGNORE_PATTERNS):
+                    room_title = line
+                    break
+
+        if not room_title:
+            room_title = clean_lines[0][:40] if clean_lines else "At End Of Road"
 
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
@@ -328,7 +331,7 @@ class GraphAgent:
         return action
 
     def _select_intrinsic_action(self, node: RoomNode) -> str:
-        if random.random() < 0.20:
+        if random.random() < 0.15:
             return random.choice(ADVENTParser.CARDINAL_DIRECTIONS)
 
         available_dirs = [d for d in ADVENTParser.CARDINAL_DIRECTIONS if d not in node.blocked_actions]
@@ -357,7 +360,7 @@ class GraphAgent:
 
 
 # =====================================================================
-# 5. SINGLE EPISODE RUNNER & MAIN LOOP
+# 5. MAIN EXECUTION LOOP
 # =====================================================================
 
 def run_agent_session(game_cmd: List[str], agent: GraphAgent, max_steps: int = 300) -> Tuple[bool, int, str, List[str]]:
@@ -374,7 +377,7 @@ def run_agent_session(game_cmd: List[str], agent: GraphAgent, max_steps: int = 3
         print(f"[Runner] Error: Executable '{game_cmd[0]}' not found in PATH.")
         sys.exit(1)
 
-    initial_output = ADVENTParser.read_nonblocking(proc, timeout=0.5)
+    initial_output = ADVENTParser.read_nonblocking(proc, timeout=1.0)
     current_stdout = initial_output
     game_won = False
     step_count = 0
@@ -399,7 +402,7 @@ def run_agent_session(game_cmd: List[str], agent: GraphAgent, max_steps: int = 3
         except BrokenPipeError:
             break
 
-        current_stdout = ADVENTParser.read_nonblocking(proc, timeout=0.2)
+        current_stdout = ADVENTParser.read_nonblocking(proc, timeout=0.1)
 
     proc.terminate()
     return game_won, step_count, current_stdout, executed_actions
@@ -431,12 +434,9 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_signal)
 
     print(f"============================================================")
-    print(f" IFGamePlayer v3.0 - Integrated Dynamic Agent Engine")
+    print(f" IFGamePlayer v3.1 - Integrated Dynamic Agent Engine")
     print(f" Command Target    : {' '.join(EXECUTABLE)}")
     print(f" Mapped Rooms      : {len(agent.graph.nodes)}")
-    print(f" Walkthrough File  : walkthrough.txt")
-    print(f" History Log File  : recent_episodes.txt")
-    print(f" Summary Viewer    : Run `python3 main.py --view` anytime")
     print(f"============================================================\n")
 
     for episode in range(1, MAX_EPISODES + 1):
@@ -451,7 +451,6 @@ if __name__ == "__main__":
             max_steps=STEPS_PER_EPISODE
         )
 
-        # Log episode and persist graph to disk immediately after each run
         logger.append_episode(
             episode_num=episode,
             steps=steps_used,
