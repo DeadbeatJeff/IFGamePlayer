@@ -17,7 +17,7 @@ import sys
 import time
 from typing import Dict, List, Optional, Set, Tuple, Any
 
-# Regex to strip terminal/ANSI escape sequences from raw stdout
+# Regex to strip terminal/ANSI escape sequences
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
 # =====================================================================
@@ -30,7 +30,7 @@ class RoomNode:
         self.description = description
         self.items: Set[str] = set()
         self.exits: Dict[str, str] = {}  # {action: target_room_id}
-        self.blocked_actions: Set[str] = set()  # Actions that yielded no move/failed
+        self.blocked_actions: Set[str] = set()
         self.lifetime_visits: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
@@ -160,39 +160,24 @@ class GraphStorage:
 
 
 class EpisodeLogger:
-    def __init__(self, log_path: str = "recent_episodes.txt", max_history: int = 10):
+    def __init__(self, log_path: str = "recent_episodes.txt"):
         self.log_path = log_path
-        self.max_history = max_history
-        self.history: List[Dict[str, Any]] = []
+        # Initialize log file with header if it doesn't exist
+        if not os.path.exists(self.log_path):
+            with open(self.log_path, "w", encoding="utf-8") as f:
+                f.write("=== IFGamePlayer Episode Log ===\n\n")
 
-    def add_episode(self, episode_num: int, steps: int, actions: List[str], final_text: str, rooms_found: int):
+    def append_episode(self, episode_num: int, steps: int, actions: List[str], final_text: str, rooms_found: int):
         score_match = re.search(r"score\s+(?:of\s+)?(\d+)", final_text, re.IGNORECASE)
         score_str = score_match.group(1) if score_match else "N/A"
+        snippet = final_text.strip().replace("\n", " ")[:150]
 
-        entry = {
-            "episode": episode_num,
-            "steps": steps,
-            "score": score_str,
-            "rooms_mapped": rooms_found,
-            "actions": actions,
-            "snippet": final_text.strip().replace("\n", " ")[:150]
-        }
-
-        self.history.append(entry)
-        if len(self.history) > self.max_history:
-            self.history.pop(0)
-
-        self._flush_to_disk()
-
-    def _flush_to_disk(self):
         try:
-            with open(self.log_path, "w", encoding="utf-8") as f:
-                f.write(f"=== IFGamePlayer Last {len(self.history)} Episodes Log ===\n\n")
-                for ep in self.history:
-                    f.write(f"Episode #{ep['episode']} | Steps: {ep['steps']} | Score: {ep['score']} | Mapped Rooms: {ep['rooms_mapped']}\n")
-                    f.write(f"Final Output: {ep['snippet']}\n")
-                    f.write(f"Command Sequence: {' -> '.join(ep['actions'])}\n")
-                    f.write("-" * 70 + "\n")
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(f"Episode #{episode_num} | Steps: {steps} | Score: {score_str} | Mapped Rooms: {rooms_found}\n")
+                f.write(f"Final Output: {snippet}\n")
+                f.write(f"Command Sequence: {' -> '.join(actions)}\n")
+                f.write("-" * 70 + "\n")
         except Exception as e:
             print(f"[Logger] Failed to write episode log: {e}")
 
@@ -227,12 +212,14 @@ class ADVENTParser:
         "would you like instructions",
         "somewhere nearby is colossal cave",
         "in the general direction",
-        "are you sure you want to quit"
+        "are you sure you want to quit",
+        "you can't",
+        "i don't"
     ]
 
     @staticmethod
     def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.5) -> str:
-        """Reads stdout from the child process until prompt '>' or timeout."""
+        """Reads process stdout until prompt '>' or timeout."""
         output = ""
         start_time = time.time()
         while time.time() - start_time < timeout:
@@ -248,18 +235,18 @@ class ADVENTParser:
 
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
-        lines = [line.strip() for line in text.split("\n") if line.strip()]
-        clean_lines = [l for l in lines if not l.startswith(">")]
-        
-        if not clean_lines:
-            return "Unknown Area", [], set(), True
+        raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
+        clean_lines = [l for l in raw_lines if not l.startswith(">")]
 
         lower_text = text.lower()
         is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
 
+        if not clean_lines:
+            return "At End Of Road", [], set(), is_noop
+
         room_title = None
 
-        # Pass 1: Look for short line without standard trailing punctuation or noisy intros
+        # Filter candidate headers
         for line in clean_lines:
             line_lower = line.lower()
             if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
@@ -270,18 +257,10 @@ class ADVENTParser:
                 room_title = line
                 break
 
-        # Pass 2: Fall back to first non-ignored line if Pass 1 yielded no title
         if not room_title:
-            for line in clean_lines:
-                line_lower = line.lower()
-                if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
-                    continue
-                room_title = line[:50]
-                break
-
-        # Ultimate fallback
-        if not room_title:
-            room_title = clean_lines[0][:50]
+            # Fallback to first line cleaned of non-alpha characters
+            first_valid = [l for l in clean_lines if len(l) > 2]
+            room_title = first_valid[0][:50] if first_valid else "At End Of Road"
 
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
@@ -438,11 +417,10 @@ if __name__ == "__main__":
 
     MAX_EPISODES = 500000
     STEPS_PER_EPISODE = 300
-    LOG_INTERVAL = 1000
     SAVE_PATH = "advent_world_graph.json"
 
     agent = GraphAgent(save_path=SAVE_PATH)
-    logger = EpisodeLogger(log_path="recent_episodes.txt", max_history=10)
+    logger = EpisodeLogger(log_path="recent_episodes.txt")
 
     def handle_signal(signum, frame):
         print("\n[Runner] Gracefully stopping and writing state to disk...")
@@ -453,17 +431,13 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_signal)
 
     print(f"============================================================")
-    print(f" IFGamePlayer v2.9 - Integrated Dynamic Agent Engine")
+    print(f" IFGamePlayer v3.0 - Integrated Dynamic Agent Engine")
     print(f" Command Target    : {' '.join(EXECUTABLE)}")
-    print(f" Loaded Rooms      : {len(agent.graph.nodes)}")
+    print(f" Mapped Rooms      : {len(agent.graph.nodes)}")
     print(f" Walkthrough File  : walkthrough.txt")
     print(f" History Log File  : recent_episodes.txt")
     print(f" Summary Viewer    : Run `python3 main.py --view` anytime")
     print(f"============================================================\n")
-
-    batch_steps = 0
-    batch_start_time = time.time()
-    last_rooms_count = len(agent.graph.nodes)
 
     for episode in range(1, MAX_EPISODES + 1):
         agent.episode_visits.clear()
@@ -476,43 +450,24 @@ if __name__ == "__main__":
             agent=agent,
             max_steps=STEPS_PER_EPISODE
         )
-        
-        batch_steps += steps_used
 
-        logger.add_episode(
+        # Log episode and persist graph to disk immediately after each run
+        logger.append_episode(
             episode_num=episode,
             steps=steps_used,
             actions=actions,
             final_text=final_stdout,
             rooms_found=len(agent.graph.nodes)
         )
+        agent.close()
+
+        print(
+            f"[EPISODE {episode:5d}] | "
+            f"Mapped Rooms: {len(agent.graph.nodes):3d} | "
+            f"Transitions: {agent.graph.total_transitions():4d} | "
+            f"Steps: {steps_used:3d}"
+        )
 
         if won:
-            agent.close()
-            print(f"\n🏆 VICTORY DETECTED on Episode {episode:,}! 🏆")
+            print(f"\n🏆 VICTORY DETECTED on Episode {episode}! 🏆")
             sys.exit(0)
-
-        if episode % LOG_INTERVAL == 0:
-            agent.close()
-            
-            elapsed = time.time() - batch_start_time
-            eps_per_sec = LOG_INTERVAL / elapsed if elapsed > 0 else 0
-            avg_steps = batch_steps / LOG_INTERVAL
-            
-            total_rooms = len(agent.graph.nodes)
-            new_rooms = total_rooms - last_rooms_count
-            total_edges = agent.graph.total_transitions()
-
-            print(
-                f"[EPISODE {episode:7,d}/{MAX_EPISODES:,}] | "
-                f"Mapped Rooms: {total_rooms:3d} (+{new_rooms:2d}) | "
-                f"Transitions: {total_edges:4d} | "
-                f"Avg Steps: {avg_steps:5.1f} | "
-                f"Speed: {eps_per_sec:5.1f} ep/s"
-            )
-
-            batch_steps = 0
-            batch_start_time = time.time()
-            last_rooms_count = total_rooms
-
-    agent.close()
