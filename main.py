@@ -19,21 +19,29 @@ except ImportError:
     sys.exit(1)
 
 def extract_room_title(observation_text):
-        """
-        Parses the room title from the Z-Machine observation string.
-        """
-        if not observation_text:
-            return "Unknown Area"
-        
-        lines = [line.strip() for line in observation_text.strip().split('\n') if line.strip()]
-        
-        for line in lines:
-            if "Welcome to Adventure" in line or "Interactive Original" in line or "Release" in line:
-                continue
-            if len(line) < 60 and not line.endswith('.'):
-                return line
-                
-        return lines[0][:40] if lines else "Unknown Area"
+    """
+    Parses the room title from the Z-Machine observation string.
+    """
+    if not observation_text:
+        return "Unknown Area"
+    
+    # Text strings that indicate a command response, not a room location
+    REJECTION_PHRASES = (
+        "You can't", "You don't", "You are unable", "What do you", 
+        "I don't think", "Welcome to", "Interactive Original", "Release"
+    )
+    
+    lines = [line.strip() for line in observation_text.strip().split('\n') if line.strip()]
+    
+    for line in lines:
+        # Skip splash headers and failure messages
+        if any(phrase in line for phrase in REJECTION_PHRASES):
+            continue
+        # Room headers are usually short lines without ending punctuation
+        if len(line) < 60 and not line.endswith('.'):
+            return line
+            
+    return lines[0][:40] if lines else "Unknown Area"
 
 
 # =====================================================================
