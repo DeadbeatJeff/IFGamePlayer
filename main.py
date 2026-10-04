@@ -215,7 +215,10 @@ class ADVENTParser:
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
         raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
-        clean_lines = [l for l in raw_lines if not l.startswith(">")]
+        clean_lines = [
+            l for l in raw_lines 
+            if not l.startswith(">") and l.lower() not in ["ok", "ok."]
+        ]
 
         lower_text = text.lower()
         is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
@@ -228,13 +231,21 @@ class ADVENTParser:
             line_lower = line.lower()
             if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
                 continue
+            # Header locations usually start with uppercase letters, don't end with sentence punctuation,
+            # and avoid typical game narrative strings.
             if not line.endswith(".") and not line.endswith("!") and not line.endswith("?"):
-                if len(line) < 50:
+                if len(line) < 50 and not line_lower.startswith("there is"):
                     room_title = line
                     break
 
         if not room_title:
-            room_title = clean_lines[0][:40] if clean_lines else "At End Of Road"
+            for line in clean_lines:
+                if not any(ig in line.lower() for ig in ADVENTParser.IGNORE_PATTERNS):
+                    room_title = line[:40]
+                    break
+
+        if not room_title:
+            room_title = "At End Of Road"
 
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
