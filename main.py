@@ -179,7 +179,12 @@ class JerichoAgent:
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
         # Query RAM directly for player location and surrounding objects
-        player_loc = env.get_player_location()
+        
+        try:
+            player_loc = env.get_player_location()
+        except (AttributeError, ValueError):
+            player_loc = None
+
         if player_loc:
             room_title = player_loc.name
             room_num = player_loc.num
