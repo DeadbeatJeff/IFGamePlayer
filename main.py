@@ -203,16 +203,33 @@ class JerichoAgent:
         self.last_action: Optional[str] = None
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
-        # Determine room title via RAM or observation text parsing
+        # Rejection phrases that Jericho/RAM occasionally assigns to location/object names
+        REJECTION_PHRASES = (
+            "You can't", "You don't", "You are unable", "What do you", 
+            "I don't think", "Welcome to", "Interactive Original", "Release",
+            "The stream flows", "But you aren't", "The pipes are"
+        )
+
+        # 1. Try RAM location first
+        room_title = None
         try:
             loc_obj = env.get_player_location()
             if loc_obj is not None and hasattr(loc_obj, 'name') and loc_obj.name:
-                room_title = loc_obj.name
-            else:
-                room_title = extract_room_title(observation)
+                title_candidate = loc_obj.name.strip()
+                if not any(phrase in title_candidate for phrase in REJECTION_PHRASES):
+                    room_title = title_candidate
         except Exception:
+            pass
+
+        # 2. Fall back to text observation parsing if RAM returned an error phrase or None
+        if not room_title:
             room_title = extract_room_title(observation)
 
+        # 3. Final validation guardrail
+        if any(phrase in room_title for phrase in REJECTION_PHRASES):
+            room_title = "Unknown Area"
+
+        # Generate unique room_id from room_title
         room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
 
         node = self.graph.get_or_create_node(room_id, room_title)
