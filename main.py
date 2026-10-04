@@ -176,36 +176,29 @@ class ADVENTParser:
         "up", "down", "in", "out", "enter", "exit", "climb"
     ]
 
-    NO_OP_PHRASES = [
-        "you can't go that way", "you can't go in that direction",
-        "nothing happens", "pitch dark", "you can't", "i don't understand"
-    ]
-
-    IGNORE_PATTERNS = [
-        "welcome to adventure", "would you like instructions",
-        "somewhere nearby is colossal cave", "are you sure you want to quit",
-        "i don't know", "i don't understand", "you can't go",
-        "in the general direction", "nothing happens", "ok", "ok."
-    ]
+    # Expanded rejection list for narrative chatter and engine responses
+    IGNORE_PREFIXES = (
+        "welcome", "would you", "somewhere nearby", "are you sure",
+        "you can't", "you cannot", "there is no way", "i don't",
+        "i do", "in the general", "there are some", "ok", "you'r",
+        "around you", "you are in"
+    )
 
     @staticmethod
     def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.3) -> str:
-        """Reads non-blocking chunks from stdout until empty or prompt character."""
-        output = ""
-        start_time = time.time()
-
-        # Set non-blocking mode on stdout file descriptor
         import fcntl
         fd = proc.stdout.fileno()
         fl = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
+        output = ""
+        start_time = time.time()
         while time.time() - start_time < timeout:
             try:
                 chunk = proc.stdout.read(1024)
                 if chunk:
                     output += chunk
-                    if ">" in chunk or "\n>" in chunk:
+                    if ">" in chunk:
                         break
                 else:
                     time.sleep(0.01)
@@ -217,48 +210,33 @@ class ADVENTParser:
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
         raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
-        
-        # Filter out command echoes (lines starting with '>') and standard system prompts
-        clean_lines = [
-            l for l in raw_lines 
-            if not l.startswith(">") and l.lower() not in ["ok", "ok."]
-        ]
+        clean_lines = [l for l in raw_lines if not l.startswith(">") and l.lower() not in ["ok", "ok."]]
 
         lower_text = text.lower()
-        is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
+        is_noop = any(phrase in lower_text for phrase in [
+            "you can't", "nothing happens", "i don't understand", "no way to go"
+        ])
 
         if not clean_lines:
             return "At End Of Road", [], set(), is_noop
 
         room_title = None
 
-        # 1. First pass: Search for a short header line near the top that isn't engine chatter
+        # Look for a short line (<35 chars) that doesn't start with known error/narrative prefixes
         for line in clean_lines:
-            line_lower = line.lower()
-            if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
+            line_l = line.lower()
+            if any(line_l.startswith(prefix) for prefix in ADVENTParser.IGNORE_PREFIXES):
                 continue
-
-            # Standard room titles in Frotz are short (<40 chars) and don't end in sentence punctuation
-            if len(line) < 40 and not line.endswith(".") and not line.endswith("!") and not line.endswith("?"):
+            
+            # True Z-machine headers are short, capitalized title phrases without sentence punctuation
+            if len(line) < 35 and not line.endswith(".") and not line.endswith("!") and not line.endswith("?"):
                 room_title = line
                 break
-
-        # 2. Fallback: Take the top valid non-ignored line, stripped of punctuation
-        if not room_title:
-            for line in clean_lines:
-                line_lower = line.lower()
-                if not any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
-                    # Extract header prior to sentence punctuation if mixed on one line
-                    parts = re.split(r'[.!?]', line)
-                    if parts and len(parts[0].strip()) > 0:
-                        candidate = parts[0].strip()
-                        if len(candidate) < 45:
-                            room_title = candidate
-                            break
 
         if not room_title:
             room_title = "At End Of Road"
 
+        # Item detection (only parse actual floor items, ignore inventory)
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
         for line in clean_lines:
@@ -351,20 +329,23 @@ class GraphAgent:
 # =====================================================================
 
 def run_agent_session(game_cmd: List[str], agent: GraphAgent, max_steps: int = 300) -> Tuple[bool, int, str, List[str]]:
-    try:
-        proc = subprocess.Popen(
-            game_cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=0
-        )
-    except FileNotFoundError:
-        print(f"[Runner] Error: Executable '{game_cmd[0]}' not found.", file=sys.stderr)
-        sys.exit(1)
+    proc = subprocess.Popen(
+        game_cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=0
+    )
 
-    initial_output = ADVENTParser.read_nonblocking(proc, timeout=0.5)
+    # Flush initial banner
+    _ = ADVENTParser.read_nonblocking(proc, timeout=0.5)
+    
+    # Force BRIEF mode so Frotz only outputs location headers on movement
+    proc.stdin.write("brief\n")
+    proc.stdin.flush()
+    initial_output = ADVENTParser.read_nonblocking(proc, timeout=0.2)
+    
     current_stdout = initial_output
     game_won = False
     step_count = 0
