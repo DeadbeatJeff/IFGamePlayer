@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 IFGamePlayer - Integrated Single-File Game Engine & Map Analyzer
-Combines non-blocking Z-Machine execution, deadlock prevention, robust title parsing,
+Combines Z-Machine execution, deadlock prevention, robust title parsing,
 graph mapping, walkthrough generation, and map visualization into one unified script.
 """
 
@@ -75,7 +75,6 @@ class WorldGraph:
         return len(items)
 
     def export_walkthrough(self, filepath: str = "walkthrough.txt"):
-        """Exports unique successful transition actions to a pipeable text file."""
         actions = []
         for nid, node in self.nodes.items():
             for action in node.exits.keys():
@@ -212,36 +211,38 @@ class ADVENTParser:
         "nothing happens",
         "pitch dark",
         "you can't",
-        "ok",
         "i don't understand",
         "already have",
-        "don't see"
+        "don't see",
+        "don't fit",
+        "impossible",
+        "no way"
     ]
 
-    IGNORE_HEADERS = [
+    IGNORE_PATTERNS = [
         "welcome to adventure",
         "would you like instructions",
         "somewhere nearby is colossal cave",
         "in the general direction",
-        "are you sure you want to quit"
+        "are you sure you want to quit",
+        "you don't",
+        "you can't",
+        "i don't"
     ]
 
     @staticmethod
-    def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.15) -> str:
-        """Reads process stdout without blocking indefinitely."""
+    def read_nonblocking(proc: subprocess.Popen, timeout: float = 0.5) -> str:
+        """Reads process stdout until prompt '>' or timeout."""
         output = ""
         start_time = time.time()
         while time.time() - start_time < timeout:
             rlist, _, _ = select.select([proc.stdout], [], [], 0.02)
             if rlist:
-                line = proc.stdout.readline()
-                if not line:
+                char = proc.stdout.read(1)
+                if not char:
                     break
-                output += line
-                if ">" in line or line.strip().endswith(":"):
-                    break
-            else:
-                if output:
+                output += char
+                if output.endswith("> "):
                     break
         return output
 
@@ -256,20 +257,18 @@ class ADVENTParser:
         lower_text = text.lower()
         is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
 
-        # Select room header line
         room_title = "Unknown Area"
         for line in clean_lines:
             line_lower = line.lower()
-            if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_HEADERS):
+            
+            # Skip noise, prompts, and sentences with end punctuation
+            if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
                 continue
-            if len(line) < 60 and not line.endswith("."):
-                room_title = line
+            if line.endswith(".") or line.endswith("!") or line.endswith("?"):
+                continue
+            if len(line) < 55:
+                room_title = line.strip()
                 break
-
-        if room_title == "Unknown Area" and clean_lines:
-            first_line = clean_lines[0]
-            if len(first_line) < 50 and not first_line.endswith("."):
-                room_title = first_line
 
         items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
@@ -314,7 +313,6 @@ class GraphAgent:
         node.lifetime_visits += 1
         self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
 
-        # Detect and flag deadlocks / blocked actions
         if self.graph.current_room_id:
             prev_node = self.graph.nodes[self.graph.current_room_id]
             if is_noop or self.graph.current_room_id == room_id:
@@ -338,25 +336,21 @@ class GraphAgent:
         return action
 
     def _select_intrinsic_action(self, node: RoomNode) -> str:
-        # 1. 20% pure random exploration (Epsilon-greedy)
         if random.random() < 0.20:
             return random.choice(ADVENTParser.CARDINAL_DIRECTIONS)
 
-        # 2. Pick unvisited & non-blocked directions
         available_dirs = [d for d in ADVENTParser.CARDINAL_DIRECTIONS if d not in node.blocked_actions]
         unvisited_dirs = [d for d in available_dirs if d not in node.exits]
         
         if unvisited_dirs:
             return random.choice(unvisited_dirs)
 
-        # 3. Take visible items ONCE per room (block after one attempt)
         untried_items = [i for i in node.items if f"take {i}" not in node.blocked_actions]
         if untried_items and random.random() < 0.10:
             item = random.choice(untried_items)
             node.blocked_actions.add(f"take {item}")
             return f"take {item}"
 
-        # 4. Count-based traversal to least-visited neighbor
         if available_dirs:
             known_dirs = [d for d in available_dirs if d in node.exits]
             if known_dirs:
@@ -413,20 +407,18 @@ def run_agent_session(game_cmd: List[str], agent: GraphAgent, max_steps: int = 3
         except BrokenPipeError:
             break
 
-        current_stdout = ADVENTParser.read_nonblocking(proc, timeout=0.15)
+        current_stdout = ADVENTParser.read_nonblocking(proc, timeout=0.2)
 
     proc.terminate()
     return game_won, step_count, current_stdout, executed_actions
 
 
 if __name__ == "__main__":
-    # Summary Viewer Flag
     if "--view" in sys.argv or "-v" in sys.argv:
         graph = GraphStorage.load_graph("advent_world_graph.json")
         graph.print_summary()
         sys.exit(0)
 
-    # Executable resolution
     EXECUTABLE = ["dfrotz", "advent.z5"] if os.path.exists("advent.z5") else ["advent"]
     if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
         EXECUTABLE = sys.argv[1:]
@@ -448,7 +440,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_signal)
 
     print(f"============================================================")
-    print(f" IFGamePlayer v2.7 - Integrated Dynamic Agent Engine")
+    print(f" IFGamePlayer v2.8 - Integrated Dynamic Agent Engine")
     print(f" Command Target    : {' '.join(EXECUTABLE)}")
     print(f" Loaded Rooms      : {len(agent.graph.nodes)}")
     print(f" Walkthrough File  : walkthrough.txt")
