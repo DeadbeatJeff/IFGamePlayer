@@ -214,7 +214,8 @@ class ADVENTParser:
         "you can't",
         "ok",
         "i don't understand",
-        "already have"
+        "already have",
+        "don't see"
     ]
 
     IGNORE_HEADERS = [
@@ -222,8 +223,6 @@ class ADVENTParser:
         "would you like instructions",
         "somewhere nearby is colossal cave",
         "in the general direction",
-        "unknown area",
-        "at end of road",
         "are you sure you want to quit"
     ]
 
@@ -257,7 +256,7 @@ class ADVENTParser:
         lower_text = text.lower()
         is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
 
-        # Select candidate room header line
+        # Select room header line
         room_title = "Unknown Area"
         for line in clean_lines:
             line_lower = line.lower()
@@ -268,7 +267,6 @@ class ADVENTParser:
                 break
 
         if room_title == "Unknown Area" and clean_lines:
-            # Fallback for valid non-standard room titles
             first_line = clean_lines[0]
             if len(first_line) < 50 and not first_line.endswith("."):
                 room_title = first_line
@@ -351,10 +349,11 @@ class GraphAgent:
         if unvisited_dirs:
             return random.choice(unvisited_dirs)
 
-        # 3. Take visible items opportunistically (ONLY if take action isn't blocked)
+        # 3. Take visible items ONCE per room (block after one attempt)
         untried_items = [i for i in node.items if f"take {i}" not in node.blocked_actions]
-        if untried_items and random.random() < 0.15:
+        if untried_items and random.random() < 0.10:
             item = random.choice(untried_items)
+            node.blocked_actions.add(f"take {item}")
             return f"take {item}"
 
         # 4. Count-based traversal to least-visited neighbor
@@ -449,7 +448,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_signal)
 
     print(f"============================================================")
-    print(f" IFGamePlayer v2.6 - Integrated Dynamic Agent Engine")
+    print(f" IFGamePlayer v2.7 - Integrated Dynamic Agent Engine")
     print(f" Command Target    : {' '.join(EXECUTABLE)}")
     print(f" Loaded Rooms      : {len(agent.graph.nodes)}")
     print(f" Walkthrough File  : walkthrough.txt")
