@@ -211,7 +211,17 @@ class ADVENTParser:
         "you can't go in that direction",
         "nothing happens",
         "pitch dark",
-        "you can't"
+        "you can't",
+        "ok",
+        "i don't understand"
+    ]
+
+    IGNORE_HEADERS = [
+        "welcome to adventure",
+        "would you like instructions",
+        "somewhere nearby is colossal cave",
+        "in the general direction",
+        "unknown area"
     ]
 
     @staticmethod
@@ -235,16 +245,34 @@ class ADVENTParser:
 
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
-        clean_lines = [line.strip() for line in text.split("\n") if line.strip() and not line.strip().startswith(">")]
+        raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
+        
+        # Filter out command prompt echoes (e.g., "> north")
+        clean_lines = [l for l in raw_lines if not l.startswith(">")]
+        
         if not clean_lines:
-            return "Unknown Area", [], set(), False
+            return "Unknown Area", [], set(), True
 
         lower_text = text.lower()
         is_noop = any(phrase in lower_text for phrase in ADVENTParser.NO_OP_PHRASES)
 
-        room_title = clean_lines[0]
-        items_found = set()
+        # Candidate selection: Find the first line that is a genuine location title
+        room_title = "Unknown Area"
+        for line in clean_lines:
+            line_lower = line.lower()
+            # Ignore banner text, instructions, and meta responses
+            if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_HEADERS):
+                continue
+            # Room titles in ADVENT are typically short lines without ending punctuation
+            if len(line) < 60 and not line.endswith("."):
+                room_title = line
+                break
         
+        # Fallback if no clean header line was found
+        if room_title == "Unknown Area" and clean_lines:
+            room_title = clean_lines[0][:40]
+
+        items_found = set()
         item_regex = re.compile(r"there is (?:a|an|some) ([\w\s]+) here", re.IGNORECASE)
         for line in clean_lines:
             match = item_regex.search(line)
@@ -256,6 +284,7 @@ class ADVENTParser:
     @staticmethod
     def generate_room_id(title: str, history: List[str]) -> str:
         clean_title = title.strip().lower()
+        # Handle the famous mazes by incorporating previous action context
         if any(w in clean_title for w in ["maze", "alike", "different"]):
             context = "->".join(history[-4:]) if history else "start"
             raw_key = f"{clean_title}|{context}"
