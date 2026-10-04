@@ -238,7 +238,7 @@ class GraphAgent:
 # 5. SUBPROCESS GAME RUNNER & MAIN LOOP
 # =====================================================================
 
-def run_agent_session(game_cmd: List[str], max_steps: int = 200, save_file: str = "advent_world_graph.json"):
+def run_agent_session(game_cmd: List[str], max_steps: int = 300, save_file: str = "advent_world_graph.json") -> bool:
     agent = GraphAgent(save_path=save_file)
 
     def handle_signal(signum, frame):
@@ -249,7 +249,6 @@ def run_agent_session(game_cmd: List[str], max_steps: int = 200, save_file: str 
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    print(f"[Runner] Launching game process: {' '.join(game_cmd)}")
     try:
         proc = subprocess.Popen(
             game_cmd,
@@ -263,11 +262,9 @@ def run_agent_session(game_cmd: List[str], max_steps: int = 200, save_file: str 
         print(f"[Runner] Error: Executable '{game_cmd[0]}' not found. Check system path.")
         sys.exit(1)
 
-    time.sleep(0.5)
+    time.sleep(0.3)
     
-    # Read initial greeting / room output
     initial_output = ""
-    # Non-blocking initial read heuristic
     while True:
         line = proc.stdout.readline()
         if not line:
@@ -276,50 +273,71 @@ def run_agent_session(game_cmd: List[str], max_steps: int = 200, save_file: str 
         if ">" in line or "Welcome" in line or "At end of road" in line:
             break
 
-    print("--- Initial Game Output ---")
-    print(initial_output.strip())
-    print("---------------------------")
-
     current_stdout = initial_output
+    game_won = False
 
     for step in range(1, max_steps + 1):
         if proc.poll() is not None:
-            print("[Runner] Game process ended unexpectedly.")
+            break
+
+        # Detect victory condition in output text
+        lower_stdout = current_stdout.lower()
+        if "350 out of" in lower_stdout or "grandmaster" in lower_stdout:
+            print("\n*** VICTORY DETECTED! The agent completed the game! ***\n")
+            game_won = True
             break
 
         action = agent.process_step(current_stdout)
-        print(f"Step {step}/{max_steps} | Room: {agent.graph.current_room_id} | Action -> '{action}'")
 
-        # Send action to game process
-        proc.stdin.write(action + "\n")
-        proc.stdin.flush()
+        try:
+            proc.stdin.write(action + "\n")
+            proc.stdin.flush()
+        except BrokenPipeError:
+            break
 
-        # Capture response
         current_stdout = ""
         while True:
             line = proc.stdout.readline()
             if not line:
                 break
             current_stdout += line
-            # Break reading loop on prompt symbol or newline timeout
             if ">" in line or line.strip().endswith(":"):
                 break
 
-    print("[Runner] Max steps reached. Terminating session.")
     proc.terminate()
     agent.close()
+    return game_won
 
 # =====================================================================
 # ENTRY POINT
 # =====================================================================
 
+# =====================================================================
+# ENTRY POINT (500,000 EPISODE TRAINING LOOP)
+# =====================================================================
+
 if __name__ == "__main__":
-    # Adjust game executable path for your sdf environment (e.g., 'advent', 'glulxe', or custom binary path)
-    EXECUTABLE = ["advent"] 
-    MAX_STEPS = 150
+    EXECUTABLE = ["advent"]
+    MAX_EPISODES = 500000
+    STEPS_PER_EPISODE = 300
     SAVE_PATH = "advent_world_graph.json"
 
     if len(sys.argv) > 1:
         EXECUTABLE = [sys.argv[1]]
 
-    run_agent_session(game_cmd=EXECUTABLE, max_steps=MAX_STEPS, save_file=SAVE_PATH)
+    print(f"[Training] Starting training session up to {MAX_EPISODES} episodes...")
+
+    for episode in range(1, MAX_EPISODES + 1):
+        print(f"\n=================== EPISODE {episode}/{MAX_EPISODES} ===================")
+        
+        won = run_agent_session(
+            game_cmd=EXECUTABLE, 
+            max_steps=STEPS_PER_EPISODE, 
+            save_file=SAVE_PATH
+        )
+
+        if won:
+            print(f"[Training] Success! Game solved on episode {episode}.")
+            break
+
+    print("[Training] Session ended.")
