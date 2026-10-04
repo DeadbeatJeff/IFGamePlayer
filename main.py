@@ -18,29 +18,29 @@ except ImportError:
     print("[Error] Jericho is not installed. Run: pip install jericho")
     sys.exit(1)
 
-def extract_room_title(observation_text):
+def extract_room_title(observation: str) -> str:
     """
-    Parses the room title from the Z-Machine observation string.
+    Parses the actual room title from the Z-Machine observation string,
+    filtering out command error responses and general descriptive text.
     """
-    if not observation_text:
+    if not observation:
         return "Unknown Area"
-    
-    # Text strings that indicate a command response, not a room location
-    REJECTION_PHRASES = (
-        "You can't", "You don't", "You are unable", "What do you", 
-        "I don't think", "Welcome to", "Interactive Original", "Release"
+
+    lines = [line.strip() for line in observation.strip().split('\n') if line.strip()]
+
+    # Strings indicating game responses rather than true room titles
+    IGNORE_PREFIXES = (
+        "You ", "What ", "I don't ", "The ", "But ", "There is ",
+        "Welcome ", "Release ", "Interactive ", "ADVENTURE"
     )
-    
-    lines = [line.strip() for line in observation_text.strip().split('\n') if line.strip()]
-    
+
     for line in lines:
-        # Skip splash headers and failure messages
-        if any(phrase in line for phrase in REJECTION_PHRASES):
-            continue
-        # Room headers are usually short lines without ending punctuation
-        if len(line) < 60 and not line.endswith('.'):
-            return line
-            
+        # True room titles are concise and don't end in punctuation like '.' or '?'
+        if len(line) < 50 and not line.endswith(('.', '?', '!')):
+            if not any(line.startswith(prefix) for prefix in IGNORE_PREFIXES):
+                return line
+
+    # Fallback to first line cleaned if no concise title found
     return lines[0][:40] if lines else "Unknown Area"
 
 
@@ -206,14 +206,13 @@ class JerichoAgent:
         # Determine room title via RAM or observation text parsing
         try:
             loc_obj = env.get_player_location()
-            if loc_obj is not None:
+            if loc_obj is not None and hasattr(loc_obj, 'name') and loc_obj.name:
                 room_title = loc_obj.name
             else:
                 room_title = extract_room_title(observation)
-        except (AttributeError, ValueError):
+        except Exception:
             room_title = extract_room_title(observation)
 
-        # Generate unique room_id from room_title (or observation text)
         room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
 
         node = self.graph.get_or_create_node(room_id, room_title)
