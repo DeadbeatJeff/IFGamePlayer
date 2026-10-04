@@ -198,21 +198,13 @@ class JerichoAgent:
         # Query RAM directly for player location and surrounding objects
         
         try:
-            player_loc = env.get_player_location()
-            if player_loc is None:
-                player_loc = extract_room_title(observation)  # Change 'obs' to match function parameter
+            loc_obj = env.get_player_location()
+            if loc_obj is not None:
+                room_title = loc_obj.name
             else:
-                player_loc = player_loc.name
+                room_title = extract_room_title(observation)
         except (AttributeError, ValueError):
-            player_loc = extract_room_title(observation)  # Change 'obs' to match function parameter
-
-        if player_loc:
-            room_title = player_loc.name
-            room_num = player_loc.num
-            room_id = f"room_{room_num}"
-        else:
-            room_title = "Unknown Area"
-            room_id = hashlib.md5(observation[:30].encode()).hexdigest()[:10]
+            room_title = extract_room_title(observation)
 
         node = self.graph.get_or_create_node(room_id, room_title)
 
