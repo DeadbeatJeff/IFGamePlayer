@@ -200,11 +200,11 @@ class JerichoAgent:
         try:
             player_loc = env.get_player_location()
             if player_loc is None:
-                player_loc = extract_room_title(obs)
+                player_loc = extract_room_title(observation)  # Change 'obs' to match function parameter
             else:
                 player_loc = player_loc.name
         except (AttributeError, ValueError):
-            player_loc = extract_room_title(obs)
+            player_loc = extract_room_title(observation)  # Change 'obs' to match function parameter
 
         if player_loc:
             room_title = player_loc.name
