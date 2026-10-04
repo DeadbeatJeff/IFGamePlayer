@@ -183,7 +183,9 @@ class ADVENTParser:
 
     IGNORE_PATTERNS = [
         "welcome to adventure", "would you like instructions",
-        "somewhere nearby is colossal cave", "are you sure you want to quit"
+        "somewhere nearby is colossal cave", "are you sure you want to quit",
+        "i don't know", "i don't understand", "you can't go",
+        "in the general direction", "nothing happens", "ok", "ok."
     ]
 
     @staticmethod
@@ -215,6 +217,8 @@ class ADVENTParser:
     @staticmethod
     def parse_stdout(text: str) -> Tuple[str, List[str], Set[str], bool]:
         raw_lines = [line.strip() for line in text.split("\n") if line.strip()]
+        
+        # Filter out command echoes (lines starting with '>') and standard system prompts
         clean_lines = [
             l for l in raw_lines 
             if not l.startswith(">") and l.lower() not in ["ok", "ok."]
@@ -227,22 +231,30 @@ class ADVENTParser:
             return "At End Of Road", [], set(), is_noop
 
         room_title = None
+
+        # 1. First pass: Search for a short header line near the top that isn't engine chatter
         for line in clean_lines:
             line_lower = line.lower()
             if any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
                 continue
-            # Header locations usually start with uppercase letters, don't end with sentence punctuation,
-            # and avoid typical game narrative strings.
-            if not line.endswith(".") and not line.endswith("!") and not line.endswith("?"):
-                if len(line) < 50 and not line_lower.startswith("there is"):
-                    room_title = line
-                    break
 
+            # Standard room titles in Frotz are short (<40 chars) and don't end in sentence punctuation
+            if len(line) < 40 and not line.endswith(".") and not line.endswith("!") and not line.endswith("?"):
+                room_title = line
+                break
+
+        # 2. Fallback: Take the top valid non-ignored line, stripped of punctuation
         if not room_title:
             for line in clean_lines:
-                if not any(ig in line.lower() for ig in ADVENTParser.IGNORE_PATTERNS):
-                    room_title = line[:40]
-                    break
+                line_lower = line.lower()
+                if not any(ignore in line_lower for ignore in ADVENTParser.IGNORE_PATTERNS):
+                    # Extract header prior to sentence punctuation if mixed on one line
+                    parts = re.split(r'[.!?]', line)
+                    if parts and len(parts[0].strip()) > 0:
+                        candidate = parts[0].strip()
+                        if len(candidate) < 45:
+                            room_title = candidate
+                            break
 
         if not room_title:
             room_title = "At End Of Road"
