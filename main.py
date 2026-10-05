@@ -159,32 +159,32 @@ class JerichoAgent:
         self.last_action = None
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
-        # 1. Deterministic room identification using Jericho's internal RAM object ID
         room_title = ""
-        room_id = None
+
+        # 1. Attempt RAM lookup for room name
         try:
             loc_obj = env.get_player_location()
-            if loc_obj is not None and hasattr(loc_obj, "num"):
-                room_id = f"room_{loc_obj.num}"
-                if hasattr(loc_obj, "name") and loc_obj.name:
-                    cand = loc_obj.name.strip()
-                    if not any(phrase in cand.lower() for phrase in REJECTION_PHRASES):
-                        room_title = cand
+            if loc_obj is not None and hasattr(loc_obj, "name") and loc_obj.name:
+                cand = loc_obj.name.strip()
+                if not any(phrase in cand.lower() for phrase in REJECTION_PHRASES):
+                    room_title = cand
         except Exception:
             pass
 
-        # Text fallback if RAM title is unavailable
+        # 2. Extract room title from text observation if RAM lookup fails
         if not room_title:
             room_title = extract_room_title(observation)
 
-        # Fallback to last known room if action failed or returned error string
-        if not room_id:
+        # 3. Handle movement rejections / persistent room state
+        if not room_title:
             if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
                 room_id = self.graph.current_room_id
                 room_title = self.graph.nodes[room_id].title
             else:
-                room_id = "room_0"
                 room_title = "At End Of Road"
+                room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
+        else:
+            room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
 
         node = self.graph.get_or_create_node(room_id, room_title)
 
