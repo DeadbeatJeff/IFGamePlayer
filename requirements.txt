@@ -1,5 +1,11 @@
-# Runtime dependency for the Jericho-backed IF environment
+# Core game environment
 jericho>=1.0.0
 
+# Numerical / ML dependencies for the agent pipeline
+numpy>=1.26
+torch>=2.2
+sentence-transformers>=2.7
+pexpect>=4.9
+
 # System package required by the game runtime:
-# Ubuntu/Debian: sudo apt install -y frotz
+# Ubuntu/Debian: sudo apt install -y frotz python3-pip python3-venv

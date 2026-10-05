@@ -1,236 +1,197 @@
-#!/usr/bin/env python3
-"""
-IFGamePlayer - Jericho-Backed RL Game Engine & Map Analyzer
-"""
-
+import argparse
+import gzip
 import hashlib
 import json
 import os
-import re
+import pickle
 import random
-import signal
 import sys
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Set, Tuple
 
-try:
-    import jericho
-except ImportError:
-    print("[Error] Jericho is not installed. Run: pip install jericho")
-    sys.exit(1)
+import jericho
+
+# ---------------------------------------------------------------------------
+# Configuration & Constants
+# ---------------------------------------------------------------------------
+CHECKPOINT_FILE = "q_checkpoint.pkl.gz"
+GRAPH_FILE = "advent_world_graph.json"
+EPISODE_LOG_FILE = "recent_episodes.txt"
+MAX_LOG_LINES = 1000
+
+CARDINAL_DIRECTIONS = [
+    "north", "south", "east", "west", "northeast", "northwest",
+    "southeast", "southwest", "up", "down", "in", "out", "enter", "exit"
+]
 
 REJECTION_PHRASES = (
-    "you can't", "you don't", "you are unable", "what do you", 
+    "you can't", "you don't", "you are unable", "what do you",
     "i don't think", "welcome to", "interactive original", "release",
     "the stream flows", "but you aren't", "the pipes are", "you can only go"
 )
 
+# ---------------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------------
 def extract_room_title(observation: str) -> str:
+    """Parses observation text for a room title if RAM object name is unavailable."""
     if not observation:
         return ""
-
-    lines = [line.strip() for line in observation.strip().split('\n') if line.strip()]
-
+    lines = [line.strip() for line in observation.strip().split("\n") if line.strip()]
     for line in lines:
         line_lower = line.lower()
-        # Skip error messages, questions, and sentences ending in full punctuation
         if any(phrase in line_lower for phrase in REJECTION_PHRASES):
             continue
-        if len(line) < 50 and not line.endswith(('.', '?', '!')):
+        if len(line) < 50 and not line.endswith((".", "?", "!")):
             return line
-
     return ""
 
+def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
+    """Appends a log entry while ensuring the file doesn't grow indefinitely on disk."""
+    lines = []
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r") as f:
+                lines = f.readlines()
+        except Exception:
+            lines = []
+    lines.append(log_line + "\n")
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    with open(filename, "w") as f:
+        f.writelines(lines)
 
-# =====================================================================
-# 1. DATA STRUCTURES & GRAPH REPRESENTATION
-# =====================================================================
-
+# ---------------------------------------------------------------------------
+# Graph & State Representation
+# ---------------------------------------------------------------------------
 class RoomNode:
-    def __init__(self, room_id: str, description: str):
+    def __init__(self, room_id: str, title: str):
         self.room_id = room_id
-        self.description = description
+        self.title = title
         self.items: Set[str] = set()
-        self.exits: Dict[str, str] = {}
         self.blocked_actions: Set[str] = set()
         self.lifetime_visits: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self):
         return {
             "room_id": self.room_id,
-            "description": self.description,
-            "items": sorted(list(self.items)),
-            "exits": self.exits,
-            "blocked_actions": sorted(list(self.blocked_actions)),
+            "title": self.title,
+            "items": list(self.items),
+            "blocked_actions": list(self.blocked_actions),
             "lifetime_visits": self.lifetime_visits,
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "RoomNode":
-        node = cls(room_id=data["room_id"], description=data.get("description", ""))
+    def from_dict(cls, data: dict):
+        node = cls(data["room_id"], data["title"])
         node.items = set(data.get("items", []))
-        node.exits = data.get("exits", {})
         node.blocked_actions = set(data.get("blocked_actions", []))
         node.lifetime_visits = data.get("lifetime_visits", 0)
         return node
 
-
 class WorldGraph:
     def __init__(self):
         self.nodes: Dict[str, RoomNode] = {}
-        self.current_room_id: Optional[str] = None
+        self.transitions: Set[Tuple[str, str, str]] = set()  # (from_id, action, to_id)
+        self.current_room_id: str = None
 
-    def get_or_create_node(self, room_id: str, description: str) -> RoomNode:
+    def get_or_create_node(self, room_id: str, title: str) -> RoomNode:
         if room_id not in self.nodes:
-            self.nodes[room_id] = RoomNode(room_id, description)
-        elif description and self.nodes[room_id].description in ["Unknown Area", ""]:
-            self.nodes[room_id].description = description
+            self.nodes[room_id] = RoomNode(room_id, title)
+        elif title and not self.nodes[room_id].title.strip():
+            self.nodes[room_id].title = title
         return self.nodes[room_id]
 
     def add_transition(self, from_id: str, action: str, to_id: str):
-        if from_id in self.nodes:
-            self.nodes[from_id].exits[action] = to_id
+        self.transitions.add((from_id, action, to_id))
 
-    def total_transitions(self) -> int:
-        return sum(len(node.exits) for node in self.nodes.values())
-
-    def total_unique_items(self) -> int:
-        items = set()
-        for node in self.nodes.values():
-            items.update(node.items)
-        return len(items)
-
-    def print_summary(self):
-        total_rooms = len(self.nodes)
-        total_edges = self.total_transitions()
-        total_items = self.total_unique_items()
-        print("=" * 65)
-        print("           IFGamePlayer World Graph Statistics")
-        print("=" * 65)
-        print(f" Total Unique Rooms Mapped : {total_rooms}")
-        print(f" Total Mapped Transitions  : {total_edges}")
-        print(f" Unique Items Discovered   : {total_items}")
-        print("=" * 65)
-        print(f"\n{'ID':<12} | {'Visits':<8} | {'Exits':<6} | {'Title / Items'}")
-        print("-" * 65)
-        sorted_nodes = sorted(self.nodes.values(), key=lambda x: x.lifetime_visits, reverse=True)
-        for n in sorted_nodes:
-            desc = n.description[:30]
-            items = f" [Items: {', '.join(n.items)}]" if n.items else ""
-            print(f"{n.room_id:<12} | {n.lifetime_visits:<8,d} | {len(n.exits):<6d} | {desc}{items}")
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "current_room_id": self.current_room_id,
-            "nodes": {nid: node.to_dict() for nid, node in self.nodes.items()},
+    def save(self, filepath: str = GRAPH_FILE):
+        data = {
+            "nodes": {rid: node.to_dict() for rid, node in self.nodes.items()},
+            "transitions": [list(t) for t in self.transitions],
         }
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "WorldGraph":
-        graph = cls()
-        graph.current_room_id = data.get("current_room_id")
-        nodes_data = data.get("nodes", {})
-        for nid, ndict in nodes_data.items():
-            graph.nodes[nid] = RoomNode.from_dict(ndict)
-        return graph
-
-
-# =====================================================================
-# 2. DISK SERIALIZATION & LOGGING
-# =====================================================================
-
-class GraphStorage:
-    @staticmethod
-    def save_graph(graph: WorldGraph, filepath: str) -> None:
-        temp_path = f"{filepath}.tmp"
-        try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(graph.to_dict(), f, indent=2)
-            os.replace(temp_path, filepath)
-        except Exception as e:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-    @staticmethod
-    def load_graph(filepath: str) -> WorldGraph:
+    def load(self, filepath: str = GRAPH_FILE):
         if not os.path.exists(filepath):
-            return WorldGraph()
+            return
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
+            with open(filepath, "r") as f:
                 data = json.load(f)
-            return WorldGraph.from_dict(data)
+            for rid, ndata in data.get("nodes", {}).items():
+                self.nodes[rid] = RoomNode.from_dict(ndata)
+            self.transitions = {tuple(t) for t in data.get("transitions", [])}
         except Exception:
-            return WorldGraph()
+            pass
 
-
-class EpisodeLogger:
-    def __init__(self, log_path: str = "recent_episodes.txt"):
-        self.log_path = log_path
-        if not os.path.exists(self.log_path):
-            with open(self.log_path, "w", encoding="utf-8") as f:
-                f.write("=== IFGamePlayer Episode Log ===\n\n")
-
-    def append_episode(self, episode_num: int, steps: int, score: int, actions: List[str], rooms_found: int):
-        summary_actions = " -> ".join(actions[:15]) + (f" ... [{len(actions)-15} more]" if len(actions) > 15 else "")
-
-        try:
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(f"Episode #{episode_num} | Steps: {steps} | Score: {score} | Mapped Rooms: {rooms_found}\n")
-                f.write(f"Command Sequence: {summary_actions}\n")
-                f.write("-" * 70 + "\n")
-                f.flush()
-        except Exception as e:
-            print(f"[Logger] Error writing log: {e}", file=sys.stderr)
-
-
-# =====================================================================
-# 3. JERICHO AGENT INTERFACE
-# =====================================================================
-
+# ---------------------------------------------------------------------------
+# Jericho Agent
+# ---------------------------------------------------------------------------
 class JerichoAgent:
-    CARDINAL_DIRECTIONS = [
-        "north", "south", "east", "west", 
-        "ne", "nw", "se", "sw", 
-        "up", "down", "in", "out", "enter", "exit", "climb"
-    ]
-
-    def __init__(self, save_path: str = "advent_world_graph.json"):
-        self.save_path = save_path
-        self.graph = GraphStorage.load_graph(self.save_path)
+    def __init__(self, alpha=0.1, gamma=0.9, epsilon=0.2):
+        self.graph = WorldGraph()
+        self.graph.load()
+        self.q_table: Dict[Tuple[str, str], float] = {}
         self.episode_visits: Dict[str, int] = {}
-        self.last_action: Optional[str] = None
+        self.last_action: str = None
+
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+
+        self.load_q_checkpoint()
+
+    def load_q_checkpoint(self, filepath: str = CHECKPOINT_FILE):
+        if os.path.exists(filepath):
+            try:
+                with gzip.open(filepath, "rb") as f:
+                    self.q_table = pickle.load(f)
+            except Exception:
+                pass
+
+    def save_q_checkpoint(self, filepath: str = CHECKPOINT_FILE):
+        with gzip.open(filepath, "wb") as f:
+            pickle.dump(self.q_table, f)
+
+    def start_episode(self):
+        self.episode_visits.clear()
+        self.graph.current_room_id = None
+        self.last_action = None
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
-    room_title = None
+        # 1. Deterministic room identification using Jericho's internal RAM object ID
+        room_title = ""
+        room_id = None
+        try:
+            loc_obj = env.get_player_location()
+            if loc_obj is not None and hasattr(loc_obj, "num"):
+                room_id = f"room_{loc_obj.num}"
+                if hasattr(loc_obj, "name") and loc_obj.name:
+                    cand = loc_obj.name.strip()
+                    if not any(phrase in cand.lower() for phrase in REJECTION_PHRASES):
+                        room_title = cand
+        except Exception:
+            pass
 
-    # Try Jericho RAM location
-    try:
-        loc_obj = env.get_player_location()
-        if loc_obj is not None and hasattr(loc_obj, 'name') and loc_obj.name:
-            cand = loc_obj.name.strip()
-            if not any(phrase in cand.lower() for phrase in REJECTION_PHRASES):
-                room_title = cand
-    except Exception:
-        pass
+        # Text fallback if RAM title is unavailable
+        if not room_title:
+            room_title = extract_room_title(observation)
 
-    # Fall back to parser
-    if not room_title:
-        room_title = extract_room_title(observation)
+        # Fallback to last known room if action failed or returned error string
+        if not room_id:
+            if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
+                room_id = self.graph.current_room_id
+                room_title = self.graph.nodes[room_id].title
+            else:
+                room_id = "room_0"
+                room_title = "At End Of Road"
 
-    # Key Guardrail: If no valid room header is detected in the response,
-    # the move failed—stay in the existing room node instead of creating a dummy node.
-    if not room_title:
-        if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
-            room_title = self.graph.nodes[self.graph.current_room_id].title
-        else:
-            room_title = "At End Of Road"  # Default starting room fallback for Adventure
+        node = self.graph.get_or_create_node(room_id, room_title)
 
-    room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
-    node = self.graph.get_or_create_node(room_id, room_title)
-
-        # Retrieve room items safely
+        # Retrieve room items
         try:
             surrounding = env.get_surrounding_objects()
-            items = [obj.name for obj in surrounding if hasattr(obj, "name")]
+            items = [obj.name for obj in surrounding if hasattr(obj, "name") and obj.name]
             node.items.update(items)
         except Exception:
             pass
@@ -238,7 +199,7 @@ class JerichoAgent:
         node.lifetime_visits += 1
         self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
 
-        # Track graph state transitions
+        # Track transitions
         if self.graph.current_room_id and self.last_action:
             if self.graph.current_room_id != room_id:
                 self.graph.add_transition(
@@ -252,129 +213,137 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        # Get candidate actions
+        # Get valid candidates
         try:
             valid_actions = env.get_valid_actions()
         except Exception:
             valid_actions = []
 
         if not valid_actions:
-            valid_actions = [a for a in self.CARDINAL_DIRECTIONS if a not in node.blocked_actions]
+            valid_actions = [a for a in CARDINAL_DIRECTIONS if a not in node.blocked_actions]
 
-        action = self._select_action(node, valid_actions)
+        action = self._select_action(node.room_id, valid_actions)
         self.last_action = action
         return action
 
-    def _select_action(self, node: RoomNode, candidate_actions: List[str]) -> str:
-        if random.random() < 0.15:
-            return random.choice(candidate_actions)
+    def _select_action(self, room_id: str, valid_actions: List[str]) -> str:
+        if not valid_actions:
+            valid_actions = CARDINAL_DIRECTIONS
 
-        unvisited = [a for a in candidate_actions if a not in node.exits and a not in node.blocked_actions]
-        if unvisited:
-            return random.choice(unvisited)
+        if random.random() < self.epsilon:
+            return random.choice(valid_actions)
 
-        known = [a for a in candidate_actions if a in node.exits]
-        if known:
-            known.sort(key=lambda a: self.episode_visits.get(node.exits[a], 0))
-            return known[0]
+        q_vals = [self.q_table.get((room_id, a), 0.0) for a in valid_actions]
+        max_q = max(q_vals)
+        best_actions = [a for a, q in zip(valid_actions, q_vals) if q == max_q]
+        return random.choice(best_actions)
 
-        return random.choice(candidate_actions)
+    def update_q(self, state: str, action: str, reward: float, next_state: str, valid_next_actions: List[str]):
+        old_q = self.q_table.get((state, action), 0.0)
+        max_next_q = max([self.q_table.get((next_state, a), 0.0) for a in valid_next_actions], default=0.0)
+        new_q = old_q + self.alpha * (reward + self.gamma * max_next_q - old_q)
+        self.q_table[(state, action)] = new_q
 
-    def close(self):
-        GraphStorage.save_graph(self.graph, self.save_path)
+# ---------------------------------------------------------------------------
+# Execution & Statistics View
+# ---------------------------------------------------------------------------
+def print_graph_stats():
+    graph = WorldGraph()
+    graph.load()
 
+    print("==================================================")
+    print("        IFGamePlayer World Graph Statistics       ")
+    print("==================================================")
+    print(f"Total Unique Rooms Mapped : {len(graph.nodes)}")
+    print(f"Total Mapped Transitions : {len(graph.transitions)}")
+    
+    all_items = set()
+    for node in graph.nodes.values():
+        all_items.update(node.items)
+    print(f"Unique Items Discovered  : {len(all_items)}")
+    print("==================================================\n")
 
-# =====================================================================
-# 4. MAIN EXECUTION LOOP
-# =====================================================================
+    print(f"{'ID':<12} | {'Visits':<8} | {'Exits':<5} | Title / Items")
+    print("-" * 65)
 
-def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300) -> Tuple[bool, int, int, List[str]]:
+    sorted_nodes = sorted(graph.nodes.values(), key=lambda n: n.lifetime_visits, reverse=True)
+    for node in sorted_nodes:
+        out_exits = sum(1 for t in graph.transitions if t[0] == node.room_id)
+        title_str = node.title if node.title else "Unknown Room"
+        if node.items:
+            title_str += f" (Items: {', '.join(node.items)})"
+        print(f"{node.room_id:<12} | {node.lifetime_visits:<8} | {out_exits:<5} | {title_str}")
+
+def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300):
     env = jericho.FrotzEnv(rom_path)
     obs, info = env.reset()
+    agent.start_episode()
 
-    executed_actions = []
-    game_won = False
-    step_count = 0
-    final_score = 0
+    total_score = 0
+    actions_taken = []
 
-    for step in range(1, max_steps + 1):
-        step_count = step
+    for step in range(max_steps):
+        curr_room_id = agent.graph.current_room_id
         action = agent.process_step(env, obs)
-        executed_actions.append(action)
+        actions_taken.append(action)
 
         obs, reward, done, info = env.step(action)
-        final_score = info.get("score", 0)
+        total_score += reward
 
-        if done or env.game_over():
-            if final_score >= 350:
-                game_won = True
+        next_room_id = agent.graph.current_room_id
+        try:
+            next_valid = env.get_valid_actions()
+        except Exception:
+            next_valid = CARDINAL_DIRECTIONS
+
+        if curr_room_id:
+            agent.update_q(curr_room_id, action, reward, next_room_id, next_valid)
+
+        if done:
             break
 
     env.close()
-    return game_won, step_count, final_score, executed_actions
+    return done, len(actions_taken), total_score, actions_taken
 
+def main():
+    parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
+    parser.add_argument("--view", action="store_true", help="Display world graph statistics and exit")
+    parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
+    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
+    args = parser.parse_args()
 
-if __name__ == "__main__":
-    if "--view" in sys.argv or "-v" in sys.argv:
-        graph = GraphStorage.load_graph("advent_world_graph.json")
-        graph.print_summary()
-        sys.exit(0)
+    if args.view:
+        print_graph_stats()
+        return
 
-    ROM_PATH = "advent.z5"
-    if not os.path.exists(ROM_PATH):
-        print(f"[Error] Could not find '{ROM_PATH}' in current directory.")
+    if not os.path.exists(args.rom):
+        print(f"ROM file '{args.rom}' not found.")
         sys.exit(1)
 
-    MAX_EPISODES = 500000
-    STEPS_PER_EPISODE = 300
-    SAVE_PATH = "advent_world_graph.json"
+    agent = JerichoAgent()
 
-    agent = JerichoAgent(save_path=SAVE_PATH)
-    logger = EpisodeLogger(log_path="recent_episodes.txt")
+    try:
+        for ep in range(1, args.episodes + 1):
+            won, steps_used, score, actions = run_jericho_episode(args.rom, agent)
+            
+            # Log progress
+            mapped_count = len(agent.graph.nodes)
+            trans_count = len(agent.graph.transitions)
+            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.0f} | Steps: {steps_used:3d}"
+            print(log_line)
+            append_rolling_log(EPISODE_LOG_FILE, log_line)
 
-    def handle_signal(signum, frame):
-        print("\n[Runner] Gracefully saving world graph...")
-        agent.close()
-        sys.exit(0)
+            # Periodically persist checkpoints
+            if ep % 50 == 0:
+                agent.graph.save()
+                agent.save_q_checkpoint()
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    except KeyboardInterrupt:
+        print("\nStopping training. Saving checkpoints...")
+    finally:
+        agent.graph.save()
+        agent.save_q_checkpoint()
+        print("Checkpoints saved successfully.")
 
-    print("============================================================")
-    print(" IFGamePlayer - Jericho Environment Interface")
-    print(f" Target Game ROM   : {ROM_PATH}")
-    print(f" Saved Graph Rooms : {len(agent.graph.nodes)}")
-    print("============================================================\n")
-
-    for episode in range(1, MAX_EPISODES + 1):
-        agent.episode_visits.clear()
-        agent.graph.current_room_id = None
-        agent.last_action = None
-
-        won, steps_used, score, actions = run_jericho_episode(
-            rom_path=ROM_PATH,
-            agent=agent,
-            max_steps=STEPS_PER_EPISODE
-        )
-
-        logger.append_episode(
-            episode_num=episode,
-            steps=steps_used,
-            score=score,
-            actions=actions,
-            rooms_found=len(agent.graph.nodes)
-        )
-        agent.close()
-
-        print(
-            f"[EPISODE {episode:5d}] | "
-            f"Mapped Rooms: {len(agent.graph.nodes):3d} | "
-            f"Transitions: {agent.graph.total_transitions():4d} | "
-            f"Score: {score:3d} | "
-            f"Steps: {steps_used:3d}"
-        )
-        sys.stdout.flush()
-
-        if won:
-            print(f"\n🏆 VICTORY DETECTED on Episode {episode}! 🏆")
-            sys.exit(0)
+if __name__ == "__main__":
+    main()
