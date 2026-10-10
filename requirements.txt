@@ -1,6 +1,5 @@
 # Core game environment
 jericho>=1.0.0
-matplotlib>=3.8
 
 # Numerical / ML dependencies for the agent pipeline
 numpy>=1.26
