@@ -6,9 +6,14 @@ import os
 import pickle
 import random
 import sys
+import warnings
 from typing import Dict, List, Set, Tuple
 
 import jericho
+from jericho.exceptions import UnsupportedGameWarning
+
+# Suppress repetitive unsupported game warnings to keep terminal logs clean
+warnings.filterwarnings("ignore", category=UnsupportedGameWarning)
 
 # ---------------------------------------------------------------------------
 # Configuration & Constants
@@ -315,6 +320,7 @@ def print_graph_stats():
         print(f"{node.room_id:<12} | {node.lifetime_visits:<8} | {out_exits:<5} | {title_str}")
 
 def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300):
+    # Load via FrotzEnv as requested
     env = jericho.FrotzEnv(rom_path)
     obs, info = env.reset()
     agent.start_episode()
