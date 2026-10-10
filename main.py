@@ -11,7 +11,7 @@ from typing import Dict, List, Set, Tuple
 
 import jericho
 
-# Suppress repetitive unsupported game warnings
+# Suppress repetitive unsupported game warnings by message match
 warnings.filterwarnings("ignore", message=".*not fully supported.*")
 warnings.filterwarnings("ignore", message=".*Unable to find valid actions.*")
 
@@ -75,6 +75,35 @@ def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LI
         lines = lines[-max_lines:]
     with open(filename, "w") as f:
         f.writelines(lines)
+
+def generate_ascii_curve(data: List[float], width: int = 60, height: int = 10) -> str:
+    """Renders a clean ASCII line graph for terminal viewing."""
+    if not data:
+        return "No episode data available for learning curve."
+    
+    if len(data) > width:
+        step = len(data) / width
+        sampled = [data[int(i * step)] for i in range(width)]
+    else:
+        sampled = data
+
+    min_val, max_val = min(sampled), max(sampled)
+    val_range = max_val - min_val if max_val != min_val else 1.0
+
+    matrix = [[' ' for _ in range(len(sampled))] for _ in range(height)]
+    
+    for col_idx, val in enumerate(sampled):
+        normalized = (val - min_val) / val_range
+        row_idx = height - 1 - int(normalized * (height - 1))
+        matrix[row_idx][col_idx] = '*'
+
+    lines = []
+    for r_idx, row in enumerate(matrix):
+        val_label = max_val - (r_idx / (height - 1)) * val_range
+        lines.append(f"{val_label:6.2f} | " + "".join(row))
+    
+    lines.append("       " + "-" * len(sampled))
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Graph & State Representation
@@ -144,7 +173,7 @@ class WorldGraph:
 # Jericho Agent
 # ---------------------------------------------------------------------------
 class JerichoAgent:
-    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.99999):
+    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995):
         self.graph = WorldGraph()
         self.graph.load()
         self.q_table: Dict[Tuple[str, str], float] = {}
@@ -183,7 +212,6 @@ class JerichoAgent:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, List[str], bool]:
-        # 1. Check if we should inject early-game bootstrap actions to jumpstart progress
         if self.step_count < len(BOOTSTRAP_ACTIONS) and random.random() < 0.7:
             action = BOOTSTRAP_ACTIONS[self.step_count]
             self.step_count += 1
@@ -248,7 +276,6 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        # Build valid action candidate pool combining directions, base verbs, and items
         valid_actions = [d for d in CARDINAL_DIRECTIONS if d not in node.blocked_actions]
         
         for verb in BASE_VERBS:
@@ -288,12 +315,53 @@ class JerichoAgent:
 def print_graph_stats():
     graph = WorldGraph()
     graph.load()
+
     print("==================================================")
     print("        IFGamePlayer World Graph Statistics       ")
     print("==================================================")
     print(f"Total Unique Rooms Mapped : {len(graph.nodes)}")
     print(f"Total Mapped Transitions : {len(graph.transitions)}")
+    
+    all_items = set()
+    for node in graph.nodes.values():
+        all_items.update(node.items)
+    print(f"Unique Items Discovered  : {len(all_items)}")
     print("==================================================\n")
+
+    # --- Parse Episode Log for Learning Curve ---
+    scores = []
+    if os.path.exists(EPISODE_LOG_FILE):
+        try:
+            with open(EPISODE_LOG_FILE, "r") as f:
+                for line in f:
+                    if "Score:" in line:
+                        parts = line.split("|")
+                        for p in parts:
+                            if "Score:" in p:
+                                val = float(p.split(":")[1].strip())
+                                scores.append(val)
+        except Exception:
+            pass
+
+    if scores:
+        print("--------------------------------------------------")
+        print("          Learning Curve (Score over Time)        ")
+        print("--------------------------------------------------")
+        print(generate_ascii_curve(scores[-100:]))
+        print(f"Total Logged Episodes : {len(scores)}")
+        print(f"Peak Recent Score     : {max(scores[-100:]) if scores else 0:.2f}")
+        print("==================================================\n")
+
+    print(f"{'ID':<12} | {'Visits':<8} | {'Exits':<5} | Title / Items")
+    print("-" * 65)
+
+    sorted_nodes = sorted(graph.nodes.values(), key=lambda n: n.lifetime_visits, reverse=True)
+    for node in sorted_nodes:
+        out_exits = sum(1 for t in graph.transitions if t[0] == node.room_id)
+        title_str = node.title if node.title else "Unknown Room"
+        if node.items:
+            title_str += f" (Items: {', '.join(node.items)})"
+        print(f"{node.room_id:<12} | {node.lifetime_visits:<8} | {out_exits:<5} | {title_str}")
 
 def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300):
     env = jericho.FrotzEnv(rom_path)
@@ -310,18 +378,14 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
         obs, reward, done, info = env.step(action)
         
-        # --- Robust Text-Based Milestone Reward Shaping ---
-        # Since unsupported ROMs disable built-in scoring hooks, we evaluate text observations:
         shaped_reward = reward
         obs_lower = obs.lower()
 
-        # Reward for picking up items, unlocking doors, or entering new rooms
         if item_acquired or "taken" in obs_lower or "opened" in obs_lower or "unlocked" in obs_lower:
-            shaped_reward += 1.0  # Significant milestone reward
+            shaped_reward += 1.0
         elif agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
-            shaped_reward += 0.1  # Exploration reward for new rooms
+            shaped_reward += 0.1
 
-        # Penalty for failure states / rejection text
         if any(rej in obs_lower for rej in ["you can't", "nothing happens", "closed", "locked"]):
             shaped_reward -= 0.02
 
@@ -347,7 +411,7 @@ def main():
     parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
     parser.add_argument("--view", action="store_true", help="Display world graph statistics and exit")
     parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
-    parser.add_argument("--episodes", type=int, default=500000, help="Number of episodes to run")
+    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
     args = parser.parse_args()
 
     if args.view:
