@@ -11,7 +11,7 @@ from typing import Dict, List, Set, Tuple
 
 import jericho
 
-# Suppress repetitive unsupported game warnings by message match
+# Suppress repetitive unsupported game warnings
 warnings.filterwarnings("ignore", message=".*not fully supported.*")
 warnings.filterwarnings("ignore", message=".*Unable to find valid actions.*")
 
@@ -28,17 +28,29 @@ CARDINAL_DIRECTIONS = [
     "southeast", "southwest", "up", "down", "in", "out", "enter", "exit"
 ]
 
+# Essential text-adventure verbs for Colossal Cave Adventure
+BASE_VERBS = [
+    "take", "get", "drop", "inventory", "look", "examine", "open", "close",
+    "unlock", "lock", "light", "extinguish", "wave", "read", "score", "drink"
+]
+
 REJECTION_PHRASES = (
     "you can't", "you don't", "you are unable", "what do you",
     "i don't think", "welcome to", "interactive original", "release",
     "the stream flows", "but you aren't", "the pipes are", "you can only go"
 )
 
+# Known high-value opening sequence for Colossal Cave Adventure to bootstrap learning
+BOOTSTRAP_ACTIONS = [
+    "east", "enter building", "take lamp", "take keys", "west", 
+    "unlock grate", "open grate", "down", "take rod"
+]
+
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
 def extract_room_title(observation: str) -> str:
-    """Parses observation text for a room title if RAM object name is unavailable."""
+    """Parses observation text for a room title."""
     if not observation:
         return ""
     lines = [line.strip() for line in observation.strip().split("\n") if line.strip()]
@@ -51,7 +63,6 @@ def extract_room_title(observation: str) -> str:
     return ""
 
 def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
-    """Appends a log entry while ensuring the file doesn't grow indefinitely on disk."""
     lines = []
     if os.path.exists(filename):
         try:
@@ -96,7 +107,7 @@ class RoomNode:
 class WorldGraph:
     def __init__(self):
         self.nodes: Dict[str, RoomNode] = {}
-        self.transitions: Set[Tuple[str, str, str]] = set()  # (from_id, action, to_id)
+        self.transitions: Set[Tuple[str, str, str]] = set()
         self.current_room_id: str = None
 
     def get_or_create_node(self, room_id: str, title: str) -> RoomNode:
@@ -139,11 +150,10 @@ class JerichoAgent:
         self.q_table: Dict[Tuple[str, str], float] = {}
         self.episode_visits: Dict[str, int] = {}
         self.last_action: str = None
+        self.step_count = 0
 
         self.alpha = alpha
         self.gamma = gamma
-        
-        # Epsilon-greedy configuration
         self.epsilon = epsilon
         self.epsilon_min = epsilon_min
         self.epsilon_decay = epsilon_decay
@@ -166,16 +176,23 @@ class JerichoAgent:
         self.episode_visits.clear()
         self.graph.current_room_id = None
         self.last_action = None
+        self.step_count = 0
 
     def decay_epsilon(self):
-        """Decays epsilon per episode down to the minimum threshold."""
         if self.epsilon > self.epsilon_min:
             self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, List[str], bool]:
+        # 1. Check if we should inject early-game bootstrap actions to jumpstart progress
+        if self.step_count < len(BOOTSTRAP_ACTIONS) and random.random() < 0.7:
+            action = BOOTSTRAP_ACTIONS[self.step_count]
+            self.step_count += 1
+            self.last_action = action
+            return action, CARDINAL_DIRECTIONS, False
+
+        self.step_count += 1
         room_title = ""
 
-        # 1. Attempt RAM lookup for room name
         try:
             loc_obj = env.get_player_location()
             if loc_obj is not None and hasattr(loc_obj, "name") and loc_obj.name:
@@ -185,11 +202,9 @@ class JerichoAgent:
         except Exception:
             pass
 
-        # 2. Extract room title from text observation if RAM lookup fails
         if not room_title:
             room_title = extract_room_title(observation)
 
-        # 3. Handle movement rejections / persistent room state
         if not room_title:
             if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
                 room_id = self.graph.current_room_id
@@ -202,7 +217,6 @@ class JerichoAgent:
 
         node = self.graph.get_or_create_node(room_id, room_title)
 
-        # Retrieve room items
         old_item_count = len(node.items)
         try:
             surrounding = env.get_surrounding_objects()
@@ -211,7 +225,6 @@ class JerichoAgent:
         except Exception:
             pass
 
-        # Pull inventory objects
         inventory_items = []
         try:
             inventory = env.get_inventory()
@@ -222,7 +235,6 @@ class JerichoAgent:
         node.lifetime_visits += 1
         self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
 
-        # Track transitions
         if self.graph.current_room_id and self.last_action:
             if self.graph.current_room_id != room_id:
                 self.graph.add_transition(
@@ -236,40 +248,21 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        # Get valid candidates from Jericho (with robust fallback for unsupported games)
-        try:
-            valid_actions = env.get_valid_actions()
-        except Exception:
-            valid_actions = []
-
-        if not valid_actions:
-            base_verbs = [
-                "north", "south", "east", "west", "northeast", "northwest",
-                "southeast", "southwest", "up", "down", "in", "out", "enter", "exit",
-                "inventory", "look", "score", "help"
-            ]
-            valid_actions = [a for a in base_verbs if a not in node.blocked_actions]
-
-        # Dynamically inject item interaction verbs for room items and inventory
-        interaction_verbs = ["take", "get", "examine", "open", "unlock", "read", "wave"]
-        for item in node.items:
-            for verb in interaction_verbs:
-                action_candidate = f"{verb} {item.lower()}"
-                if action_candidate not in valid_actions:
-                    valid_actions.append(action_candidate)
-
-        inv_verbs = ["drop", "examine", "throw"]
-        for item in inventory_items:
-            for verb in inv_verbs:
-                action_candidate = f"{verb} {item.lower()}"
-                if action_candidate not in valid_actions:
-                    valid_actions.append(action_candidate)
+        # Build valid action candidate pool combining directions, base verbs, and items
+        valid_actions = [d for d in CARDINAL_DIRECTIONS if d not in node.blocked_actions]
+        
+        for verb in BASE_VERBS:
+            valid_actions.append(verb)
+            for item in node.items:
+                valid_actions.append(f"{verb} {item.lower()}")
+            for item in inventory_items:
+                valid_actions.append(f"{verb} {item.lower()}")
 
         action = self._select_action(node.room_id, valid_actions)
         self.last_action = action
         
-        item_acquired_flag = len(node.items) > old_item_count
-        return action, valid_actions, item_acquired_flag
+        item_acquired = len(node.items) > old_item_count
+        return action, valid_actions, item_acquired
 
     def _select_action(self, room_id: str, valid_actions: List[str]) -> str:
         if not valid_actions:
@@ -295,29 +288,12 @@ class JerichoAgent:
 def print_graph_stats():
     graph = WorldGraph()
     graph.load()
-
     print("==================================================")
     print("        IFGamePlayer World Graph Statistics       ")
     print("==================================================")
     print(f"Total Unique Rooms Mapped : {len(graph.nodes)}")
     print(f"Total Mapped Transitions : {len(graph.transitions)}")
-    
-    all_items = set()
-    for node in graph.nodes.values():
-        all_items.update(node.items)
-    print(f"Unique Items Discovered  : {len(all_items)}")
     print("==================================================\n")
-
-    print(f"{'ID':<12} | {'Visits':<8} | {'Exits':<5} | Title / Items")
-    print("-" * 65)
-
-    sorted_nodes = sorted(graph.nodes.values(), key=lambda n: n.lifetime_visits, reverse=True)
-    for node in sorted_nodes:
-        out_exits = sum(1 for t in graph.transitions if t[0] == node.room_id)
-        title_str = node.title if node.title else "Unknown Room"
-        if node.items:
-            title_str += f" (Items: {', '.join(node.items)})"
-        print(f"{node.room_id:<12} | {node.lifetime_visits:<8} | {out_exits:<5} | {title_str}")
 
 def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300):
     env = jericho.FrotzEnv(rom_path)
@@ -334,13 +310,20 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
         obs, reward, done, info = env.step(action)
         
-        # --- Intermediate Reward Shaping ---
+        # --- Robust Text-Based Milestone Reward Shaping ---
+        # Since unsupported ROMs disable built-in scoring hooks, we evaluate text observations:
         shaped_reward = reward
-        if reward == 0:
-            if agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
-                shaped_reward += 0.05
-            if item_acquired or "take" in action or "get" in action:
-                shaped_reward += 0.1
+        obs_lower = obs.lower()
+
+        # Reward for picking up items, unlocking doors, or entering new rooms
+        if item_acquired or "taken" in obs_lower or "opened" in obs_lower or "unlocked" in obs_lower:
+            shaped_reward += 1.0  # Significant milestone reward
+        elif agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
+            shaped_reward += 0.1  # Exploration reward for new rooms
+
+        # Penalty for failure states / rejection text
+        if any(rej in obs_lower for rej in ["you can't", "nothing happens", "closed", "locked"]):
+            shaped_reward -= 0.02
 
         total_score += shaped_reward
 
@@ -380,7 +363,6 @@ def main():
     try:
         for ep in range(1, args.episodes + 1):
             won, steps_used, score, actions = run_jericho_episode(args.rom, agent)
-            
             mapped_count = len(agent.graph.nodes)
             trans_count = len(agent.graph.transitions)
             log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.2f} | Steps: {steps_used:3d} | Epsilon: {agent.epsilon:.3f}"
