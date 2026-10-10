@@ -9,6 +9,7 @@ import sys
 import warnings
 from typing import Dict, List, Set, Tuple
 
+import matplotlib.pyplot as plt
 import jericho
 
 # Suppress repetitive unsupported game warnings by message match
@@ -28,7 +29,6 @@ CARDINAL_DIRECTIONS = [
     "southeast", "southwest", "up", "down", "in", "out", "enter", "exit"
 ]
 
-# Essential text-adventure verbs for Colossal Cave Adventure
 BASE_VERBS = [
     "take", "get", "drop", "inventory", "look", "examine", "open", "close",
     "unlock", "lock", "light", "extinguish", "wave", "read", "score", "drink"
@@ -40,7 +40,6 @@ REJECTION_PHRASES = (
     "the stream flows", "but you aren't", "the pipes are", "you can only go"
 )
 
-# Known high-value opening sequence for Colossal Cave Adventure to bootstrap learning
 BOOTSTRAP_ACTIONS = [
     "east", "enter building", "take lamp", "take keys", "west", 
     "unlock grate", "open grate", "down", "take rod"
@@ -76,34 +75,32 @@ def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LI
     with open(filename, "w") as f:
         f.writelines(lines)
 
-def generate_ascii_curve(data: List[float], width: int = 60, height: int = 10) -> str:
-    """Renders a clean ASCII line graph for terminal viewing."""
-    if not data:
-        return "No episode data available for learning curve."
-    
-    if len(data) > width:
-        step = len(data) / width
-        sampled = [data[int(i * step)] for i in range(width)]
-    else:
-        sampled = data
+def generate_matplotlib_curve(scores: List[float]):
+    """Generates and saves a publication-quality learning curve chart (learning_curve.png)."""
+    if not scores:
+        print("No score data available to plot.")
+        return
 
-    min_val, max_val = min(sampled), max(sampled)
-    val_range = max_val - min_val if max_val != min_val else 1.0
+    window_size = max(5, len(scores) // 20)
+    rolling_avg = []
+    for i in range(len(scores)):
+        window = scores[max(0, i - window_size + 1):i + 1]
+        rolling_avg.append(sum(window) / len(window))
 
-    matrix = [[' ' for _ in range(len(sampled))] for _ in range(height)]
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(scores) + 1), scores, label="Episode Score (Raw)", color="blue", alpha=0.3, linestyle="--")
+    plt.plot(range(1, len(scores) + 1), rolling_avg, label=f"Smoothed Trend (MA-{window_size})", color="green", linewidth=2)
     
-    for col_idx, val in enumerate(sampled):
-        normalized = (val - min_val) / val_range
-        row_idx = height - 1 - int(normalized * (height - 1))
-        matrix[row_idx][col_idx] = '*'
-
-    lines = []
-    for r_idx, row in enumerate(matrix):
-        val_label = max_val - (r_idx / (height - 1)) * val_range
-        lines.append(f"{val_label:6.2f} | " + "".join(row))
+    plt.title("LEARNING CURVE FOR Q-LEARNING AGENT", fontsize=14, fontweight='bold')
+    plt.xlabel("Training Episodes", fontsize=12)
+    plt.ylabel("Score / Performance", fontsize=12)
+    plt.legend(loc="lower right", fontsize=11)
+    plt.grid(True, linestyle=":", alpha=0.6)
     
-    lines.append("       " + "-" * len(sampled))
-    return "\n".join(lines)
+    output_path = "learning_curve.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"\n[INFO] Publication-quality learning curve saved to '{output_path}'!")
 
 # ---------------------------------------------------------------------------
 # Graph & State Representation
@@ -173,7 +170,7 @@ class WorldGraph:
 # Jericho Agent
 # ---------------------------------------------------------------------------
 class JerichoAgent:
-    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995):
+    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.99999):
         self.graph = WorldGraph()
         self.graph.load()
         self.q_table: Dict[Tuple[str, str], float] = {}
@@ -328,7 +325,7 @@ def print_graph_stats():
     print(f"Unique Items Discovered  : {len(all_items)}")
     print("==================================================\n")
 
-    # --- Parse Episode Log for Learning Curve ---
+    # --- Parse Episode Log and Generate Matplotlib Learning Curve ---
     scores = []
     if os.path.exists(EPISODE_LOG_FILE):
         try:
@@ -344,12 +341,9 @@ def print_graph_stats():
             pass
 
     if scores:
-        print("--------------------------------------------------")
-        print("          Learning Curve (Score over Time)        ")
-        print("--------------------------------------------------")
-        print(generate_ascii_curve(scores[-100:]))
+        generate_matplotlib_curve(scores)
         print(f"Total Logged Episodes : {len(scores)}")
-        print(f"Peak Recent Score     : {max(scores[-100:]) if scores else 0:.2f}")
+        print(f"Peak Score Recorded   : {max(scores) if scores else 0:.2f}")
         print("==================================================\n")
 
     print(f"{'ID':<12} | {'Visits':<8} | {'Exits':<5} | Title / Items")
@@ -409,7 +403,7 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
 def main():
     parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
-    parser.add_argument("--view", action="store_true", help="Display world graph statistics and exit")
+    parser.add_argument("--view", action="store_true", help="Display world graph statistics and save learning curve graph")
     parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
     args = parser.parse_args()
