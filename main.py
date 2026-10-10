@@ -128,7 +128,7 @@ class WorldGraph:
 # Jericho Agent
 # ---------------------------------------------------------------------------
 class JerichoAgent:
-    def __init__(self, alpha=0.1, gamma=0.9, epsilon=0.2):
+    def __init__(self, alpha=1.0, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995):
         self.graph = WorldGraph()
         self.graph.load()
         self.q_table: Dict[Tuple[str, str], float] = {}
@@ -137,7 +137,11 @@ class JerichoAgent:
 
         self.alpha = alpha
         self.gamma = gamma
+        
+        # Epsilon-greedy configuration (change initial/decay values here)
         self.epsilon = epsilon
+        self.epsilon_min = epsilon_min
+        self.epsilon_decay = epsilon_decay
 
         self.load_q_checkpoint()
 
@@ -158,7 +162,12 @@ class JerichoAgent:
         self.graph.current_room_id = None
         self.last_action = None
 
-    def process_step(self, env: jericho.FrotzEnv, observation: str) -> str:
+    def decay_epsilon(self):
+        """Decays epsilon per episode down to the minimum threshold."""
+        if self.epsilon > self.epsilon_min:
+            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def process_step(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, List[str]]:
         room_title = ""
 
         # 1. Attempt RAM lookup for room name
@@ -188,11 +197,20 @@ class JerichoAgent:
 
         node = self.graph.get_or_create_node(room_id, room_title)
 
-        # Retrieve room items
+        # Retrieve room items using Jericho API and observation parsing fallbacks
+        old_item_count = len(node.items)
         try:
             surrounding = env.get_surrounding_objects()
             items = [obj.name for obj in surrounding if hasattr(obj, "name") and obj.name]
             node.items.update(items)
+        except Exception:
+            pass
+
+        # Also pull inventory objects so items in possession can be dropped/managed
+        inventory_items = []
+        try:
+            inventory = env.get_inventory()
+            inventory_items = [obj.name for obj in inventory if hasattr(obj, "name") and obj.name]
         except Exception:
             pass
 
@@ -213,7 +231,7 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        # Get valid candidates
+        # Get valid candidates from Jericho
         try:
             valid_actions = env.get_valid_actions()
         except Exception:
@@ -222,9 +240,27 @@ class JerichoAgent:
         if not valid_actions:
             valid_actions = [a for a in CARDINAL_DIRECTIONS if a not in node.blocked_actions]
 
+        # Dynamically inject item interaction verbs for room items and inventory items
+        interaction_verbs = ["take", "get", "examine", "open", "unlock"]
+        for item in node.items:
+            for verb in interaction_verbs:
+                action_candidate = f"{verb} {item.lower()}"
+                if action_candidate not in valid_actions:
+                    valid_actions.append(action_candidate)
+
+        inv_verbs = ["drop", "examine", "throw"]
+        for item in inventory_items:
+            for verb in inv_verbs:
+                action_candidate = f"{verb} {item.lower()}"
+                if action_candidate not in valid_actions:
+                    valid_actions.append(action_candidate)
+
         action = self._select_action(node.room_id, valid_actions)
         self.last_action = action
-        return action
+        
+        # Return action and whether a new item was discovered
+        item_acquired_flag = len(node.items) > old_item_count
+        return action, valid_actions, item_acquired_flag
 
     def _select_action(self, room_id: str, valid_actions: List[str]) -> str:
         if not valid_actions:
@@ -284,11 +320,21 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
     for step in range(max_steps):
         curr_room_id = agent.graph.current_room_id
-        action = agent.process_step(env, obs)
+        action, valid_next, item_acquired = agent.process_step(env, obs)
         actions_taken.append(action)
 
         obs, reward, done, info = env.step(action)
-        total_score += reward
+        
+        # --- Intermediate Reward Shaping ---
+        shaped_reward = reward
+        if reward == 0:
+            # Small bonus for discovering new rooms or interacting with items
+            if agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
+                shaped_reward += 0.05
+            if item_acquired or "take" in action or "get" in action:
+                shaped_reward += 0.1  # Encourage picking up items
+
+        total_score += shaped_reward
 
         next_room_id = agent.graph.current_room_id
         try:
@@ -297,12 +343,13 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
             next_valid = CARDINAL_DIRECTIONS
 
         if curr_room_id:
-            agent.update_q(curr_room_id, action, reward, next_room_id, next_valid)
+            agent.update_q(curr_room_id, action, shaped_reward, next_room_id, next_valid)
 
         if done:
             break
 
     env.close()
+    agent.decay_epsilon()
     return done, len(actions_taken), total_score, actions_taken
 
 def main():
@@ -329,7 +376,7 @@ def main():
             # Log progress
             mapped_count = len(agent.graph.nodes)
             trans_count = len(agent.graph.transitions)
-            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.0f} | Steps: {steps_used:3d}"
+            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.2f} | Steps: {steps_used:3d} | Epsilon: {agent.epsilon:.3f}"
             print(log_line)
             append_rolling_log(EPISODE_LOG_FILE, log_line)
 
