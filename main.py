@@ -144,7 +144,7 @@ class WorldGraph:
 # Jericho Agent
 # ---------------------------------------------------------------------------
 class JerichoAgent:
-    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995):
+    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.999):
         self.graph = WorldGraph()
         self.graph.load()
         self.q_table: Dict[Tuple[str, str], float] = {}
@@ -347,7 +347,7 @@ def main():
     parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
     parser.add_argument("--view", action="store_true", help="Display world graph statistics and exit")
     parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
-    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
+    parser.add_argument("--episodes", type=int, default=500000, help="Number of episodes to run")
     args = parser.parse_args()
 
     if args.view:
