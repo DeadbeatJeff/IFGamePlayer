@@ -74,6 +74,23 @@ def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LI
     with open(filename, "w") as f:
         f.writelines(lines)
 
+def get_last_episode_index(filename: str = EPISODE_LOG_FILE) -> int:
+    """Scans the episode log to resume numbering from where it left off."""
+    if not os.path.exists(filename):
+        return 0
+    last_ep = 0
+    try:
+        with open(filename, "r") as f:
+            for line in f:
+                if "[EPISODE" in line:
+                    parts = line.split("]")
+                    ep_str = parts[0].replace("[EPISODE", "").strip()
+                    if ep_str.isdigit():
+                        last_ep = int(ep_str)
+    except Exception:
+        pass
+    return last_ep
+
 def generate_learning_curve_to_350(scores: List[float], width: int = 60, height: int = 12) -> str:
     """Renders an ASCII learning curve scaled from 0 to 350 against optimal walkthrough target."""
     if not scores:
@@ -328,7 +345,6 @@ def print_graph_stats():
     print(f"Unique Items Discovered  : {len(all_items)}")
     print("==================================================\n")
 
-    # --- Parse Episode Log and Print Learning Curve to 350 ---
     scores = []
     if os.path.exists(EPISODE_LOG_FILE):
         try:
@@ -378,7 +394,6 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
         obs, reward, done, info = env.step(action)
         
-        # Try to pull true game score if supported, otherwise accumulate milestone rewards
         try:
             true_score = env.get_score()
         except Exception:
@@ -388,7 +403,7 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
         obs_lower = obs.lower()
 
         if item_acquired or "taken" in obs_lower or "opened" in obs_lower or "unlocked" in obs_lower:
-            step_reward += 5.0  # Milestone progression toward 350
+            step_reward += 5.0
         elif agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
             step_reward += 0.5
 
@@ -412,7 +427,7 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
 def main():
     parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
-    parser.add_argument("--view", action="store_true", help="Display world graph statistics and learning curve to 350")
+    parser.add_argument("--view", action="store_true", help="Display world graph statistics and learning curve")
     parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
     args = parser.parse_args()
@@ -427,8 +442,12 @@ def main():
 
     agent = JerichoAgent()
 
+    # Resume episode numbering from the last logged entry
+    start_ep = get_last_episode_index(EPISODE_LOG_FILE) + 1
+    end_ep = start_ep + args.episodes
+
     try:
-        for ep in range(1, args.episodes + 1):
+        for ep in range(start_ep, end_ep):
             won, steps_used, score, actions = run_jericho_episode(args.rom, agent)
             mapped_count = len(agent.graph.nodes)
             trans_count = len(agent.graph.transitions)
