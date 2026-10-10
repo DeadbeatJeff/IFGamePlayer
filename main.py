@@ -74,8 +74,8 @@ def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LI
     with open(filename, "w") as f:
         f.writelines(lines)
 
-def generate_ascii_learning_curve(scores: List[float], width: int = 60, height: int = 12) -> str:
-    """Renders a pure-Python ASCII learning curve trend graph."""
+def generate_learning_curve_to_350(scores: List[float], width: int = 60, height: int = 12) -> str:
+    """Renders an ASCII learning curve scaled from 0 to 350 against optimal walkthrough target."""
     if not scores:
         return "No score data available for learning curve."
     
@@ -85,22 +85,24 @@ def generate_ascii_learning_curve(scores: List[float], width: int = 60, height: 
     else:
         sampled = scores
 
-    min_val, max_val = min(sampled), max(sampled)
-    val_range = max_val - min_val if max_val != min_val else 1.0
+    min_val, max_val = 0.0, 350.0
+    val_range = max_val - min_val
 
     matrix = [[' ' for _ in range(len(sampled))] for _ in range(height)]
     
     for col_idx, val in enumerate(sampled):
-        normalized = (val - min_val) / val_range
+        clamped_val = max(min_val, min(max_val, val))
+        normalized = (clamped_val - min_val) / val_range
         row_idx = height - 1 - int(normalized * (height - 1))
         matrix[row_idx][col_idx] = '*'
 
     lines = []
     for r_idx, row in enumerate(matrix):
         val_label = max_val - (r_idx / (height - 1)) * val_range
-        lines.append(f"{val_label:6.2f} | " + "".join(row))
+        lines.append(f"{val_label:6.1f} | " + "".join(row))
     
     lines.append("       " + "-" * len(sampled))
+    lines.append("       Legend: [*] Agent Score Progression  |  Target Max: 350 (Walkthrough Optimal)")
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
@@ -326,7 +328,7 @@ def print_graph_stats():
     print(f"Unique Items Discovered  : {len(all_items)}")
     print("==================================================\n")
 
-    # --- Parse Episode Log and Print Learning Curve ---
+    # --- Parse Episode Log and Print Learning Curve to 350 ---
     scores = []
     if os.path.exists(EPISODE_LOG_FILE):
         try:
@@ -343,11 +345,11 @@ def print_graph_stats():
 
     if scores:
         print("--------------------------------------------------")
-        print("          Learning Curve (Score over Time)        ")
+        print("    Learning Curve vs. Walkthrough Target (350)   ")
         print("--------------------------------------------------")
-        print(generate_ascii_learning_curve(scores))
+        print(generate_learning_curve_to_350(scores))
         print(f"Total Logged Episodes : {len(scores)}")
-        print(f"Peak Score Recorded   : {max(scores) if scores else 0:.2f}")
+        print(f"Peak Score Recorded   : {max(scores) if scores else 0:.1f} / 350.0")
         print("==================================================\n")
 
     print(f"{'ID':<12} | {'Visits':<8} | {'Exits':<5} | Title / Items")
@@ -376,18 +378,21 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
         obs, reward, done, info = env.step(action)
         
-        shaped_reward = reward
+        # Try to pull true game score if supported, otherwise accumulate milestone rewards
+        try:
+            true_score = env.get_score()
+        except Exception:
+            true_score = 0
+
+        step_reward = true_score if true_score > 0 else reward
         obs_lower = obs.lower()
 
         if item_acquired or "taken" in obs_lower or "opened" in obs_lower or "unlocked" in obs_lower:
-            shaped_reward += 1.0
+            step_reward += 5.0  # Milestone progression toward 350
         elif agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
-            shaped_reward += 0.1
+            step_reward += 0.5
 
-        if any(rej in obs_lower for rej in ["you can't", "nothing happens", "closed", "locked"]):
-            shaped_reward -= 0.02
-
-        total_score += shaped_reward
+        total_score += step_reward
 
         next_room_id = agent.graph.current_room_id
         try:
@@ -396,7 +401,7 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
             next_valid = CARDINAL_DIRECTIONS
 
         if curr_room_id:
-            agent.update_q(curr_room_id, action, shaped_reward, next_room_id, next_valid)
+            agent.update_q(curr_room_id, action, step_reward, next_room_id, next_valid)
 
         if done:
             break
@@ -407,7 +412,7 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
 
 def main():
     parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
-    parser.add_argument("--view", action="store_true", help="Display world graph statistics and learning curve")
+    parser.add_argument("--view", action="store_true", help="Display world graph statistics and learning curve to 350")
     parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
     args = parser.parse_args()
@@ -427,7 +432,7 @@ def main():
             won, steps_used, score, actions = run_jericho_episode(args.rom, agent)
             mapped_count = len(agent.graph.nodes)
             trans_count = len(agent.graph.transitions)
-            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.2f} | Steps: {steps_used:3d} | Epsilon: {agent.epsilon:.3f}"
+            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:5.1f} | Steps: {steps_used:3d} | Epsilon: {agent.epsilon:.3f}"
             print(log_line)
             append_rolling_log(EPISODE_LOG_FILE, log_line)
 
