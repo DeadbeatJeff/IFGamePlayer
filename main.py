@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore", message=".*Unable to find valid actions.*")
 # ---------------------------------------------------------------------------
 CHECKPOINT_FILE = "q_checkpoint.pkl.gz"
 GRAPH_FILE = "advent_world_graph.json"
-EPISODE_LOG_FILE = "recent_episodes.txt"
+EPISODE_LOG_FILE = "recent_episodes.txt.gz"
 MAX_LOG_LINES = 1000
 
 CARDINAL_DIRECTIONS = [
@@ -61,26 +61,27 @@ def extract_room_title(observation: str) -> str:
     return ""
 
 def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
+    """Appends a log entry to a gzipped rolling log file."""
     lines = []
     if os.path.exists(filename):
         try:
-            with open(filename, "r") as f:
+            with gzip.open(filename, "rt", encoding="utf-8") as f:
                 lines = f.readlines()
         except Exception:
             lines = []
     lines.append(log_line + "\n")
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
-    with open(filename, "w") as f:
+    with gzip.open(filename, "wt", encoding="utf-8") as f:
         f.writelines(lines)
 
 def get_last_episode_index(filename: str = EPISODE_LOG_FILE) -> int:
-    """Scans the episode log to resume numbering from where it left off."""
+    """Scans the gzipped episode log to resume numbering from where it left off."""
     if not os.path.exists(filename):
         return 0
     last_ep = 0
     try:
-        with open(filename, "r") as f:
+        with gzip.open(filename, "rt", encoding="utf-8") as f:
             for line in f:
                 if "[EPISODE" in line:
                     parts = line.split("]")
@@ -190,7 +191,7 @@ class WorldGraph:
 # Jericho Agent
 # ---------------------------------------------------------------------------
 class JerichoAgent:
-    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.999999):
+    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995):
         self.graph = WorldGraph()
         self.graph.load()
         self.q_table: Dict[Tuple[str, str], float] = {}
@@ -348,7 +349,7 @@ def print_graph_stats():
     scores = []
     if os.path.exists(EPISODE_LOG_FILE):
         try:
-            with open(EPISODE_LOG_FILE, "r") as f:
+            with gzip.open(EPISODE_LOG_FILE, "rt", encoding="utf-8") as f:
                 for line in f:
                     if "Score:" in line:
                         parts = line.split("|")
