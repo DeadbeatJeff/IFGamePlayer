@@ -188,7 +188,7 @@ class WorldGraph:
             pass
 
 # ---------------------------------------------------------------------------
-# Jericho Agent
+# Jericho Agent with Potential-Based Reward Shaping (PBRS)
 # ---------------------------------------------------------------------------
 class JerichoAgent:
     def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.995):
@@ -321,10 +321,26 @@ class JerichoAgent:
         best_actions = [a for a, q in zip(valid_actions, q_vals) if q == max_q]
         return random.choice(best_actions)
 
-    def update_q(self, state: str, action: str, reward: float, next_state: str, valid_next_actions: List[str]):
+    def update_q_with_pbrs(self, state: str, action: str, extrinsic_reward: float, next_state: str, valid_next_actions: List[str]):
+        """
+        Updates Q-values using Potential-Based Reward Shaping (PBRS):
+        F(s, a, s') = gamma * Phi(s') - Phi(s), where Phi(s) = max_a Q(s, a)
+        """
+        # Get state potentials Phi(s) and Phi(s')
+        current_q_vals = [self.q_table.get((state, a), 0.0) for a in valid_next_actions]
+        phi_s = max(current_q_vals) if current_q_vals else 0.0
+
+        next_q_vals = [self.q_table.get((next_state, a), 0.0) for a in valid_next_actions]
+        phi_s_next = max(next_q_vals) if next_q_vals else 0.0
+
+        # Potential-based shaping term F(s, a, s')
+        shaping_reward = self.gamma * phi_s_next - phi_s
+        shaped_reward = extrinsic_reward + shaping_reward
+
+        # Standard Q-learning update with shaped reward
         old_q = self.q_table.get((state, action), 0.0)
-        max_next_q = max([self.q_table.get((next_state, a), 0.0) for a in valid_next_actions], default=0.0)
-        new_q = old_q + self.alpha * (reward + self.gamma * max_next_q - old_q)
+        max_next_q = phi_s_next
+        new_q = old_q + self.alpha * (shaped_reward + self.gamma * max_next_q - old_q)
         self.q_table[(state, action)] = new_q
 
 # ---------------------------------------------------------------------------
@@ -400,15 +416,16 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
         except Exception:
             true_score = 0
 
-        step_reward = true_score if true_score > 0 else reward
+        extrinsic_reward = true_score if true_score > 0 else reward
         obs_lower = obs.lower()
 
+        # Milestone shaping bonuses for text observations
         if item_acquired or "taken" in obs_lower or "opened" in obs_lower or "unlocked" in obs_lower:
-            step_reward += 5.0
+            extrinsic_reward += 5.0
         elif agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
-            step_reward += 0.5
+            extrinsic_reward += 0.5
 
-        total_score += step_reward
+        total_score += extrinsic_reward
 
         next_room_id = agent.graph.current_room_id
         try:
@@ -417,7 +434,7 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
             next_valid = CARDINAL_DIRECTIONS
 
         if curr_room_id:
-            agent.update_q(curr_room_id, action, step_reward, next_room_id, next_valid)
+            agent.update_q_with_pbrs(curr_room_id, action, extrinsic_reward, next_room_id, next_valid)
 
         if done:
             break
@@ -443,7 +460,7 @@ def main():
 
     agent = JerichoAgent()
 
-    # Resume episode numbering from the last logged entry
+    # Resume episode numbering from the last gzipped log entry
     start_ep = get_last_episode_index(EPISODE_LOG_FILE) + 1
     end_ep = start_ep + args.episodes
 
