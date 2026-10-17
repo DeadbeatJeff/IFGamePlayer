@@ -6,6 +6,7 @@ import math
 import os
 import pickle
 import random
+import re
 import sys
 from typing import Dict, List, Set, Tuple
 
@@ -24,11 +25,17 @@ CARDINAL_DIRECTIONS = [
     "southeast", "southwest", "up", "down", "in", "out", "enter", "exit"
 ]
 
+REJECTION_PHRASES = (
+    "you can't", "you don't", "you are unable", "what do you",
+    "i don't think", "welcome to", "interactive original", "release",
+    "the stream flows", "but you aren't", "the pipes are", "you can only go"
+)
+
 # ---------------------------------------------------------------------------
-# Compressed Logging Helper
+# Compressed Logging & Episode Tracking Helpers
 # ---------------------------------------------------------------------------
 def append_rolling_log_gz(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
-    """Appends a log entry to a gzipped log file while maintaining a maximum line count."""
+    """Appends a log entry to a gzipped log file while keeping a rolling max line limit."""
     lines = []
     if os.path.exists(filename):
         try:
@@ -43,6 +50,23 @@ def append_rolling_log_gz(filename: str, log_line: str, max_lines: int = MAX_LOG
         
     with gzip.open(filename, "wt", encoding="utf-8") as f:
         f.writelines(lines)
+
+def get_last_episode_number(filename: str) -> int:
+    """Reads the last completed episode number from the gzipped log file."""
+    if not os.path.exists(filename):
+        return 0
+    try:
+        with gzip.open(filename, "rt", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+            if not lines:
+                return 0
+            last_line = lines[-1]
+            match = re.search(r"\[EPISODE\s+(\d+)\]", last_line)
+            if match:
+                return int(match.group(1))
+    except Exception:
+        pass
+    return 0
 
 # ---------------------------------------------------------------------------
 # Graph & State Representation
@@ -89,7 +113,6 @@ class WorldGraph:
         self.transitions.add((from_id, action, to_id))
 
     def save(self, filepath: str = GRAPH_FILE):
-        """Saves world graph state directly as gzipped JSON."""
         data = {
             "nodes": {rid: node.to_dict() for rid, node in self.nodes.items()},
             "transitions": [list(t) for t in self.transitions],
@@ -98,8 +121,6 @@ class WorldGraph:
             json.dump(data, f, indent=2)
 
     def load(self, filepath: str = GRAPH_FILE):
-        """Loads world graph state supporting both .json.gz and legacy .json files."""
-        # Check for gzipped file first, fall back to uncompressed legacy file if needed
         target_path = filepath
         if not os.path.exists(target_path) and os.path.exists("advent_world_graph.json"):
             target_path = "advent_world_graph.json"
@@ -136,7 +157,7 @@ class JerichoAgent:
         self.alpha = alpha
         self.gamma = gamma
         self.epsilon = epsilon
-        self.beta = beta  # Intrinsic exploration reward scalar
+        self.beta = beta
 
         self.load_q_checkpoint()
 
@@ -161,17 +182,12 @@ class JerichoAgent:
         self.last_action = None
 
     def get_state_key_and_title(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, str]:
-        """
-        Determines the room ID and title reliably across Z-Machine games.
-        Tries Jericho RAM first, then falls back to MD5 hashing of parsed room titles.
-        """
         room_title = ""
 
         # 1. Try Jericho RAM location
         try:
             loc_obj = env.get_player_location()
             if loc_obj is not None:
-                # Check for RAM object integer ID directly
                 if hasattr(loc_obj, "num"):
                     room_id = f"room_{loc_obj.num}"
                     title = loc_obj.name.strip() if hasattr(loc_obj, "name") and loc_obj.name else f"Room {loc_obj.num}"
@@ -183,11 +199,6 @@ class JerichoAgent:
 
         # 2. Text observation parsing fallback
         if not room_title:
-            REJECTION_PHRASES = (
-                "you can't", "you don't", "you are unable", "what do you",
-                "i don't think", "welcome to", "interactive original", "release",
-                "the stream flows", "but you aren't", "the pipes are", "you can only go"
-            )
             lines = [line.strip() for line in observation.strip().split("\n") if line.strip()]
             for line in lines:
                 if not any(phrase in line.lower() for phrase in REJECTION_PHRASES):
@@ -195,7 +206,7 @@ class JerichoAgent:
                         room_title = line
                         break
 
-        # 3. Handle action failures / unparsed observations by remaining in current room
+        # 3. Movement error / unchanged location fallback
         if not room_title:
             if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
                 return self.graph.current_room_id, self.graph.nodes[self.graph.current_room_id].title
@@ -209,7 +220,7 @@ class JerichoAgent:
         room_id, room_title = self.get_state_key_and_title(env, observation)
         node = self.graph.get_or_create_node(room_id, room_title)
 
-        # Extract surrounding items from RAM
+        # Extract surrounding RAM objects
         surrounding_items = []
         try:
             surrounding = env.get_surrounding_objects()
@@ -226,7 +237,7 @@ class JerichoAgent:
         node.lifetime_visits += 1
         self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
 
-        # Track graph transitions
+        # Track transitions
         if self.graph.current_room_id and self.last_action:
             if self.graph.current_room_id != room_id:
                 self.graph.add_transition(
@@ -240,7 +251,7 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        # Build candidate action space
+        # Get valid action space
         try:
             valid_actions = env.get_valid_actions()
         except Exception:
@@ -249,12 +260,20 @@ class JerichoAgent:
         if not valid_actions:
             valid_actions = [a for a in CARDINAL_DIRECTIONS if a not in node.blocked_actions]
 
-        # Inject specific item interactions
+        # Inject RAM item verbs
         item_actions = []
         for item in surrounding_items:
             item_actions.extend([f"take {item}", f"get {item}", f"examine {item}"])
 
-        candidate_actions = list(set(valid_actions + item_actions))
+        # Inject Contextual Adventure Actions (Solves early-game puzzle sequence)
+        context_actions = []
+        rt_lower = room_title.lower()
+        if "building" in rt_lower:
+            context_actions.extend(["take keys", "take lamp", "take lantern", "take food", "take bottle", "xyzzy"])
+        elif "grate" in rt_lower:
+            context_actions.extend(["unlock grate", "open grate", "unlock grate with keys", "down"])
+
+        candidate_actions = list(set(valid_actions + item_actions + context_actions))
         action = self._select_action(node.room_id, candidate_actions)
         self.last_action = action
 
@@ -349,7 +368,7 @@ def main():
     parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
     parser.add_argument("--view", action="store_true", help="Display world graph statistics and exit")
     parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
-    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
+    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run from current checkpoint")
     args = parser.parse_args()
 
     if args.view:
@@ -361,9 +380,13 @@ def main():
         sys.exit(1)
 
     agent = JerichoAgent()
+    
+    # Pick up with episode counts naturally from existing logs
+    start_ep = get_last_episode_number(EPISODE_LOG_FILE) + 1
+    end_ep = start_ep + args.episodes - 1
 
     try:
-        for ep in range(1, args.episodes + 1):
+        for ep in range(start_ep, end_ep + 1):
             won, steps_used, score, actions = run_jericho_episode(args.rom, agent)
             
             mapped_count = len(agent.graph.nodes)
