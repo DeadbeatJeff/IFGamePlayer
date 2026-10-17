@@ -15,8 +15,8 @@ import jericho
 # Configuration & Constants
 # ---------------------------------------------------------------------------
 CHECKPOINT_FILE = "q_checkpoint.pkl.gz"
-GRAPH_FILE = "advent_world_graph.json"
-EPISODE_LOG_FILE = "recent_episodes.txt"
+GRAPH_FILE = "advent_world_graph.json.gz"
+EPISODE_LOG_FILE = "recent_episodes.txt.gz"
 MAX_LOG_LINES = 1000
 
 CARDINAL_DIRECTIONS = [
@@ -25,21 +25,23 @@ CARDINAL_DIRECTIONS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Logging Helper
+# Compressed Logging Helper
 # ---------------------------------------------------------------------------
-def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
-    """Appends a log entry while ensuring the log file doesn't grow indefinitely."""
+def append_rolling_log_gz(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
+    """Appends a log entry to a gzipped log file while maintaining a maximum line count."""
     lines = []
     if os.path.exists(filename):
         try:
-            with open(filename, "r") as f:
+            with gzip.open(filename, "rt", encoding="utf-8") as f:
                 lines = f.readlines()
         except Exception:
             lines = []
+            
     lines.append(log_line + "\n")
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
-    with open(filename, "w") as f:
+        
+    with gzip.open(filename, "wt", encoding="utf-8") as f:
         f.writelines(lines)
 
 # ---------------------------------------------------------------------------
@@ -87,19 +89,32 @@ class WorldGraph:
         self.transitions.add((from_id, action, to_id))
 
     def save(self, filepath: str = GRAPH_FILE):
+        """Saves world graph state directly as gzipped JSON."""
         data = {
             "nodes": {rid: node.to_dict() for rid, node in self.nodes.items()},
             "transitions": [list(t) for t in self.transitions],
         }
-        with open(filepath, "w") as f:
+        with gzip.open(filepath, "wt", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     def load(self, filepath: str = GRAPH_FILE):
-        if not os.path.exists(filepath):
+        """Loads world graph state supporting both .json.gz and legacy .json files."""
+        # Check for gzipped file first, fall back to uncompressed legacy file if needed
+        target_path = filepath
+        if not os.path.exists(target_path) and os.path.exists("advent_world_graph.json"):
+            target_path = "advent_world_graph.json"
+
+        if not os.path.exists(target_path):
             return
+
         try:
-            with open(filepath, "r") as f:
-                data = json.load(f)
+            if target_path.endswith(".gz"):
+                with gzip.open(target_path, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
             for rid, ndata in data.get("nodes", {}).items():
                 self.nodes[rid] = RoomNode.from_dict(ndata)
             self.transitions = {tuple(t) for t in data.get("transitions", [])}
@@ -156,7 +171,6 @@ class JerichoAgent:
         except Exception:
             pass
 
-        # Safety fallback using hash if RAM fails
         if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
             return self.graph.current_room_id, self.graph.nodes[self.graph.current_room_id].title
         
@@ -167,7 +181,7 @@ class JerichoAgent:
         room_id, room_title = self.get_state_key_and_title(env, observation)
         node = self.graph.get_or_create_node(room_id, room_title)
 
-        # 1. Dynamically extract surrounding items from RAM
+        # Extract surrounding items from RAM
         surrounding_items = []
         try:
             surrounding = env.get_surrounding_objects()
@@ -184,7 +198,7 @@ class JerichoAgent:
         node.lifetime_visits += 1
         self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
 
-        # 2. Track graph transitions
+        # Track graph transitions
         if self.graph.current_room_id and self.last_action:
             if self.graph.current_room_id != room_id:
                 self.graph.add_transition(
@@ -198,7 +212,7 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        # 3. Build candidate action space (Movement + Dynamic Item Interactions)
+        # Build candidate action space
         try:
             valid_actions = env.get_valid_actions()
         except Exception:
@@ -235,12 +249,8 @@ class JerichoAgent:
         self.state_action_counts[sa_key] = self.state_action_counts.get(sa_key, 0) + 1
         visit_count = self.state_action_counts[sa_key]
 
-        # Novelty Bonus: Inverse square-root of state-action visit count
         intrinsic_reward = self.beta / math.sqrt(visit_count)
-
-        # Loop Penalty: Discourage back-and-forth toggling in the same episode
         loop_penalty = -0.1 if self.episode_visits.get(next_state, 0) > 1 else 0.0
-
         total_reward = env_reward + intrinsic_reward + loop_penalty
 
         old_q = self.q_table.get(sa_key, 0.0)
@@ -332,7 +342,7 @@ def main():
             trans_count = len(agent.graph.transitions)
             log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.0f} | Steps: {steps_used:3d}"
             print(log_line)
-            append_rolling_log(EPISODE_LOG_FILE, log_line)
+            append_rolling_log_gz(EPISODE_LOG_FILE, log_line)
 
             if ep % 50 == 0:
                 agent.graph.save()
