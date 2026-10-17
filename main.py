@@ -2,25 +2,21 @@ import argparse
 import gzip
 import hashlib
 import json
+import math
 import os
 import pickle
 import random
 import sys
-import warnings
 from typing import Dict, List, Set, Tuple
 
 import jericho
-
-# Suppress repetitive unsupported game warnings by message match
-warnings.filterwarnings("ignore", message=".*not fully supported.*")
-warnings.filterwarnings("ignore", message=".*Unable to find valid actions.*")
 
 # ---------------------------------------------------------------------------
 # Configuration & Constants
 # ---------------------------------------------------------------------------
 CHECKPOINT_FILE = "q_checkpoint.pkl.gz"
 GRAPH_FILE = "advent_world_graph.json"
-EPISODE_LOG_FILE = "recent_episodes.txt.gz"
+EPISODE_LOG_FILE = "recent_episodes.txt"
 MAX_LOG_LINES = 1000
 
 CARDINAL_DIRECTIONS = [
@@ -28,100 +24,23 @@ CARDINAL_DIRECTIONS = [
     "southeast", "southwest", "up", "down", "in", "out", "enter", "exit"
 ]
 
-BASE_VERBS = [
-    "take", "get", "drop", "inventory", "look", "examine", "open", "close",
-    "unlock", "lock", "light", "extinguish", "wave", "read", "score", "drink"
-]
-
-REJECTION_PHRASES = (
-    "you can't", "you don't", "you are unable", "what do you",
-    "i don't think", "welcome to", "interactive original", "release",
-    "the stream flows", "but you aren't", "the pipes are", "you can only go"
-)
-
-BOOTSTRAP_ACTIONS = [
-    "east", "enter building", "take lamp", "take keys", "west", 
-    "unlock grate", "open grate", "down", "take rod"
-]
-
 # ---------------------------------------------------------------------------
-# Helper Functions
+# Logging Helper
 # ---------------------------------------------------------------------------
-def extract_room_title(observation: str) -> str:
-    """Parses observation text for a room title."""
-    if not observation:
-        return ""
-    lines = [line.strip() for line in observation.strip().split("\n") if line.strip()]
-    for line in lines:
-        line_lower = line.lower()
-        if any(phrase in line_lower for phrase in REJECTION_PHRASES):
-            continue
-        if len(line) < 50 and not line.endswith((".", "?", "!")):
-            return line
-    return ""
-
 def append_rolling_log(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
-    """Appends a log entry to a gzipped rolling log file."""
+    """Appends a log entry while ensuring the log file doesn't grow indefinitely."""
     lines = []
     if os.path.exists(filename):
         try:
-            with gzip.open(filename, "rt", encoding="utf-8") as f:
+            with open(filename, "r") as f:
                 lines = f.readlines()
         except Exception:
             lines = []
     lines.append(log_line + "\n")
     if len(lines) > max_lines:
         lines = lines[-max_lines:]
-    with gzip.open(filename, "wt", encoding="utf-8") as f:
+    with open(filename, "w") as f:
         f.writelines(lines)
-
-def get_last_episode_index(filename: str = EPISODE_LOG_FILE) -> int:
-    """Scans the gzipped episode log to resume numbering from where it left off."""
-    if not os.path.exists(filename):
-        return 0
-    last_ep = 0
-    try:
-        with gzip.open(filename, "rt", encoding="utf-8") as f:
-            for line in f:
-                if "[EPISODE" in line:
-                    parts = line.split("]")
-                    ep_str = parts[0].replace("[EPISODE", "").strip()
-                    if ep_str.isdigit():
-                        last_ep = int(ep_str)
-    except Exception:
-        pass
-    return last_ep
-
-def generate_learning_curve_to_350(scores: List[float], width: int = 60, height: int = 12) -> str:
-    """Renders an ASCII learning curve scaled from 0 to 350 against optimal walkthrough target."""
-    if not scores:
-        return "No score data available for learning curve."
-    
-    if len(scores) > width:
-        step = len(scores) / width
-        sampled = [scores[int(i * step)] for i in range(width)]
-    else:
-        sampled = scores
-
-    min_val, max_val = 0.0, 350.0
-    val_range = max_val - min_val
-
-    matrix = [[' ' for _ in range(len(sampled))] for _ in range(height)]
-    
-    for col_idx, val in enumerate(sampled):
-        clamped_val = max(min_val, min(max_val, val))
-        normalized = (clamped_val - min_val) / val_range
-        row_idx = height - 1 - int(normalized * (height - 1))
-        matrix[row_idx][col_idx] = '*'
-
-    lines = []
-    for r_idx, row in enumerate(matrix):
-        val_label = max_val - (r_idx / (height - 1)) * val_range
-        lines.append(f"{val_label:6.1f} | " + "".join(row))
-    
-    lines.append("       " + "-" * len(sampled))
-    lines.append("       Legend: [*] Agent Score Progression  |  Target Max: 350 (Walkthrough Optimal)")
-    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # Graph & State Representation
@@ -154,7 +73,7 @@ class RoomNode:
 class WorldGraph:
     def __init__(self):
         self.nodes: Dict[str, RoomNode] = {}
-        self.transitions: Set[Tuple[str, str, str]] = set()
+        self.transitions: Set[Tuple[str, str, str]] = set()  # (from_id, action, to_id)
         self.current_room_id: str = None
 
     def get_or_create_node(self, room_id: str, title: str) -> RoomNode:
@@ -188,22 +107,21 @@ class WorldGraph:
             pass
 
 # ---------------------------------------------------------------------------
-# Jericho Agent with Potential-Based Reward Shaping (PBRS)
+# Jericho Agent with Novelty-Driven Exploration
 # ---------------------------------------------------------------------------
 class JerichoAgent:
-    def __init__(self, alpha=0.1, gamma=0.9, epsilon=1.0, epsilon_min=0.05, epsilon_decay=0.999999):
+    def __init__(self, alpha=0.2, gamma=0.95, epsilon=0.2, beta=1.0):
         self.graph = WorldGraph()
         self.graph.load()
         self.q_table: Dict[Tuple[str, str], float] = {}
+        self.state_action_counts: Dict[Tuple[str, str], int] = {}
         self.episode_visits: Dict[str, int] = {}
         self.last_action: str = None
-        self.step_count = 0
 
         self.alpha = alpha
         self.gamma = gamma
         self.epsilon = epsilon
-        self.epsilon_min = epsilon_min
-        self.epsilon_decay = epsilon_decay
+        self.beta = beta  # Intrinsic exploration reward scalar
 
         self.load_q_checkpoint()
 
@@ -211,76 +129,62 @@ class JerichoAgent:
         if os.path.exists(filepath):
             try:
                 with gzip.open(filepath, "rb") as f:
-                    self.q_table = pickle.load(f)
+                    data = pickle.load(f)
+                    if isinstance(data, dict):
+                        self.q_table = data.get("q_table", data)
+                        self.state_action_counts = data.get("counts", {})
             except Exception:
                 pass
 
     def save_q_checkpoint(self, filepath: str = CHECKPOINT_FILE):
         with gzip.open(filepath, "wb") as f:
-            pickle.dump(self.q_table, f)
+            pickle.dump({"q_table": self.q_table, "counts": self.state_action_counts}, f)
 
     def start_episode(self):
         self.episode_visits.clear()
         self.graph.current_room_id = None
         self.last_action = None
-        self.step_count = 0
 
-    def decay_epsilon(self):
-        if self.epsilon > self.epsilon_min:
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
-    def process_step(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, List[str], bool]:
-        if self.step_count < len(BOOTSTRAP_ACTIONS) and random.random() < 0.7:
-            action = BOOTSTRAP_ACTIONS[self.step_count]
-            self.step_count += 1
-            self.last_action = action
-            return action, CARDINAL_DIRECTIONS, False
-
-        self.step_count += 1
-        room_title = ""
-
+    def get_state_key_and_title(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, str]:
+        """Strictly relies on Jericho RAM object IDs for deterministic location state."""
         try:
             loc_obj = env.get_player_location()
-            if loc_obj is not None and hasattr(loc_obj, "name") and loc_obj.name:
-                cand = loc_obj.name.strip()
-                if not any(phrase in cand.lower() for phrase in REJECTION_PHRASES):
-                    room_title = cand
+            if loc_obj is not None and hasattr(loc_obj, "num"):
+                room_id = f"room_{loc_obj.num}"
+                room_title = loc_obj.name.strip() if hasattr(loc_obj, "name") and loc_obj.name else f"Room {loc_obj.num}"
+                return room_id, room_title
         except Exception:
             pass
 
-        if not room_title:
-            room_title = extract_room_title(observation)
+        # Safety fallback using hash if RAM fails
+        if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
+            return self.graph.current_room_id, self.graph.nodes[self.graph.current_room_id].title
+        
+        fallback_id = "room_0"
+        return fallback_id, "At End Of Road"
 
-        if not room_title:
-            if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
-                room_id = self.graph.current_room_id
-                room_title = self.graph.nodes[room_id].title
-            else:
-                room_title = "At End Of Road"
-                room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
-        else:
-            room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
-
+    def process_step(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, str, List[str]]:
+        room_id, room_title = self.get_state_key_and_title(env, observation)
         node = self.graph.get_or_create_node(room_id, room_title)
 
-        old_item_count = len(node.items)
+        # 1. Dynamically extract surrounding items from RAM
+        surrounding_items = []
         try:
             surrounding = env.get_surrounding_objects()
-            items = [obj.name for obj in surrounding if hasattr(obj, "name") and obj.name]
-            node.items.update(items)
-        except Exception:
-            pass
-
-        inventory_items = []
-        try:
-            inventory = env.get_inventory()
-            inventory_items = [obj.name for obj in inventory if hasattr(obj, "name") and obj.name]
+            loc_obj = env.get_player_location()
+            loc_num = loc_obj.num if loc_obj else -1
+            
+            for obj in surrounding:
+                if hasattr(obj, "name") and obj.name and obj.num != loc_num:
+                    node.items.add(obj.name)
+                    surrounding_items.append(obj.name)
         except Exception:
             pass
 
         node.lifetime_visits += 1
         self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
 
+        # 2. Track graph transitions
         if self.graph.current_room_id and self.last_action:
             if self.graph.current_room_id != room_id:
                 self.graph.add_transition(
@@ -294,20 +198,25 @@ class JerichoAgent:
 
         self.graph.current_room_id = room_id
 
-        valid_actions = [d for d in CARDINAL_DIRECTIONS if d not in node.blocked_actions]
-        
-        for verb in BASE_VERBS:
-            valid_actions.append(verb)
-            for item in node.items:
-                valid_actions.append(f"{verb} {item.lower()}")
-            for item in inventory_items:
-                valid_actions.append(f"{verb} {item.lower()}")
+        # 3. Build candidate action space (Movement + Dynamic Item Interactions)
+        try:
+            valid_actions = env.get_valid_actions()
+        except Exception:
+            valid_actions = []
 
-        action = self._select_action(node.room_id, valid_actions)
+        if not valid_actions:
+            valid_actions = [a for a in CARDINAL_DIRECTIONS if a not in node.blocked_actions]
+
+        # Inject specific item interactions
+        item_actions = []
+        for item in surrounding_items:
+            item_actions.extend([f"take {item}", f"get {item}", f"examine {item}"])
+
+        candidate_actions = list(set(valid_actions + item_actions))
+        action = self._select_action(node.room_id, candidate_actions)
         self.last_action = action
-        
-        item_acquired = len(node.items) > old_item_count
-        return action, valid_actions, item_acquired
+
+        return room_id, action, candidate_actions
 
     def _select_action(self, room_id: str, valid_actions: List[str]) -> str:
         if not valid_actions:
@@ -321,27 +230,23 @@ class JerichoAgent:
         best_actions = [a for a, q in zip(valid_actions, q_vals) if q == max_q]
         return random.choice(best_actions)
 
-    def update_q_with_pbrs(self, state: str, action: str, extrinsic_reward: float, next_state: str, valid_next_actions: List[str]):
-        """
-        Updates Q-values using Potential-Based Reward Shaping (PBRS):
-        F(s, a, s') = gamma * Phi(s') - Phi(s), where Phi(s) = max_a Q(s, a)
-        """
-        # Get state potentials Phi(s) and Phi(s')
-        current_q_vals = [self.q_table.get((state, a), 0.0) for a in valid_next_actions]
-        phi_s = max(current_q_vals) if current_q_vals else 0.0
+    def update_q(self, state: str, action: str, env_reward: float, next_state: str, valid_next_actions: List[str]):
+        sa_key = (state, action)
+        self.state_action_counts[sa_key] = self.state_action_counts.get(sa_key, 0) + 1
+        visit_count = self.state_action_counts[sa_key]
 
-        next_q_vals = [self.q_table.get((next_state, a), 0.0) for a in valid_next_actions]
-        phi_s_next = max(next_q_vals) if next_q_vals else 0.0
+        # Novelty Bonus: Inverse square-root of state-action visit count
+        intrinsic_reward = self.beta / math.sqrt(visit_count)
 
-        # Potential-based shaping term F(s, a, s')
-        shaping_reward = self.gamma * phi_s_next - phi_s
-        shaped_reward = extrinsic_reward + shaping_reward
+        # Loop Penalty: Discourage back-and-forth toggling in the same episode
+        loop_penalty = -0.1 if self.episode_visits.get(next_state, 0) > 1 else 0.0
 
-        # Standard Q-learning update with shaped reward
-        old_q = self.q_table.get((state, action), 0.0)
-        max_next_q = phi_s_next
-        new_q = old_q + self.alpha * (shaped_reward + self.gamma * max_next_q - old_q)
-        self.q_table[(state, action)] = new_q
+        total_reward = env_reward + intrinsic_reward + loop_penalty
+
+        old_q = self.q_table.get(sa_key, 0.0)
+        max_next_q = max([self.q_table.get((next_state, a), 0.0) for a in valid_next_actions], default=0.0)
+        new_q = old_q + self.alpha * (total_reward + self.gamma * max_next_q - old_q)
+        self.q_table[sa_key] = new_q
 
 # ---------------------------------------------------------------------------
 # Execution & Statistics View
@@ -361,29 +266,6 @@ def print_graph_stats():
         all_items.update(node.items)
     print(f"Unique Items Discovered  : {len(all_items)}")
     print("==================================================\n")
-
-    scores = []
-    if os.path.exists(EPISODE_LOG_FILE):
-        try:
-            with gzip.open(EPISODE_LOG_FILE, "rt", encoding="utf-8") as f:
-                for line in f:
-                    if "Score:" in line:
-                        parts = line.split("|")
-                        for p in parts:
-                            if "Score:" in p:
-                                val = float(p.split(":")[1].strip())
-                                scores.append(val)
-        except Exception:
-            pass
-
-    if scores:
-        print("--------------------------------------------------")
-        print("    Learning Curve vs. Walkthrough Target (350)   ")
-        print("--------------------------------------------------")
-        print(generate_learning_curve_to_350(scores))
-        print(f"Total Logged Episodes : {len(scores)}")
-        print(f"Peak Score Recorded   : {max(scores) if scores else 0:.1f} / 350.0")
-        print("==================================================\n")
 
     print(f"{'ID':<12} | {'Visits':<8} | {'Exits':<5} | Title / Items")
     print("-" * 65)
@@ -405,47 +287,29 @@ def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300
     actions_taken = []
 
     for step in range(max_steps):
-        curr_room_id = agent.graph.current_room_id
-        action, valid_next, item_acquired = agent.process_step(env, obs)
+        curr_room_id, action, candidates = agent.process_step(env, obs)
         actions_taken.append(action)
 
         obs, reward, done, info = env.step(action)
-        
-        try:
-            true_score = env.get_score()
-        except Exception:
-            true_score = 0
+        total_score += reward
 
-        extrinsic_reward = true_score if true_score > 0 else reward
-        obs_lower = obs.lower()
-
-        # Milestone shaping bonuses for text observations
-        if item_acquired or "taken" in obs_lower or "opened" in obs_lower or "unlocked" in obs_lower:
-            extrinsic_reward += 5.0
-        elif agent.graph.current_room_id and agent.graph.nodes[agent.graph.current_room_id].lifetime_visits == 1:
-            extrinsic_reward += 0.5
-
-        total_score += extrinsic_reward
-
-        next_room_id = agent.graph.current_room_id
+        next_room_id, _ = agent.get_state_key_and_title(env, obs)
         try:
             next_valid = env.get_valid_actions()
         except Exception:
             next_valid = CARDINAL_DIRECTIONS
 
-        if curr_room_id:
-            agent.update_q_with_pbrs(curr_room_id, action, extrinsic_reward, next_room_id, next_valid)
+        agent.update_q(curr_room_id, action, reward, next_room_id, next_valid)
 
         if done:
             break
 
     env.close()
-    agent.decay_epsilon()
     return done, len(actions_taken), total_score, actions_taken
 
 def main():
     parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
-    parser.add_argument("--view", action="store_true", help="Display world graph statistics and learning curve")
+    parser.add_argument("--view", action="store_true", help="Display world graph statistics and exit")
     parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
     parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run")
     args = parser.parse_args()
@@ -460,16 +324,13 @@ def main():
 
     agent = JerichoAgent()
 
-    # Resume episode numbering from the last gzipped log entry
-    start_ep = get_last_episode_index(EPISODE_LOG_FILE) + 1
-    end_ep = start_ep + args.episodes
-
     try:
-        for ep in range(start_ep, end_ep):
+        for ep in range(1, args.episodes + 1):
             won, steps_used, score, actions = run_jericho_episode(args.rom, agent)
+            
             mapped_count = len(agent.graph.nodes)
             trans_count = len(agent.graph.transitions)
-            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:5.1f} | Steps: {steps_used:3d} | Epsilon: {agent.epsilon:.3f}"
+            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.0f} | Steps: {steps_used:3d}"
             print(log_line)
             append_rolling_log(EPISODE_LOG_FILE, log_line)
 
