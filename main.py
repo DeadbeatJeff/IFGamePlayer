@@ -161,21 +161,49 @@ class JerichoAgent:
         self.last_action = None
 
     def get_state_key_and_title(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, str]:
-        """Strictly relies on Jericho RAM object IDs for deterministic location state."""
+        """
+        Determines the room ID and title reliably across Z-Machine games.
+        Tries Jericho RAM first, then falls back to MD5 hashing of parsed room titles.
+        """
+        room_title = ""
+
+        # 1. Try Jericho RAM location
         try:
             loc_obj = env.get_player_location()
-            if loc_obj is not None and hasattr(loc_obj, "num"):
-                room_id = f"room_{loc_obj.num}"
-                room_title = loc_obj.name.strip() if hasattr(loc_obj, "name") and loc_obj.name else f"Room {loc_obj.num}"
-                return room_id, room_title
+            if loc_obj is not None:
+                # Check for RAM object integer ID directly
+                if hasattr(loc_obj, "num"):
+                    room_id = f"room_{loc_obj.num}"
+                    title = loc_obj.name.strip() if hasattr(loc_obj, "name") and loc_obj.name else f"Room {loc_obj.num}"
+                    return room_id, title
+                elif hasattr(loc_obj, "name") and loc_obj.name:
+                    room_title = loc_obj.name.strip()
         except Exception:
             pass
 
-        if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
-            return self.graph.current_room_id, self.graph.nodes[self.graph.current_room_id].title
-        
-        fallback_id = "room_0"
-        return fallback_id, "At End Of Road"
+        # 2. Text observation parsing fallback
+        if not room_title:
+            REJECTION_PHRASES = (
+                "you can't", "you don't", "you are unable", "what do you",
+                "i don't think", "welcome to", "interactive original", "release",
+                "the stream flows", "but you aren't", "the pipes are", "you can only go"
+            )
+            lines = [line.strip() for line in observation.strip().split("\n") if line.strip()]
+            for line in lines:
+                if not any(phrase in line.lower() for phrase in REJECTION_PHRASES):
+                    if len(line) < 50 and not line.endswith((".", "?", "!")):
+                        room_title = line
+                        break
+
+        # 3. Handle action failures / unparsed observations by remaining in current room
+        if not room_title:
+            if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
+                return self.graph.current_room_id, self.graph.nodes[self.graph.current_room_id].title
+            else:
+                room_title = "At End Of Road"
+
+        room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
+        return room_id, room_title
 
     def process_step(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, str, List[str]]:
         room_id, room_title = self.get_state_key_and_title(env, observation)
