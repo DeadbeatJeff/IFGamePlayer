@@ -33,3 +33,6 @@ Thumbs.db
 # Local env files
 .env
 .env.*
+
+# Game files
+advent.z5
