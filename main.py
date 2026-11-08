@@ -1,294 +1,415 @@
 import argparse
-import re
+import gzip
+import hashlib
+import json
+import math
+import os
+import pickle
 import random
-import collections
-from pathlib import Path
-import shutil
-import pexpect
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from sentence_transformers import SentenceTransformer
+import re
+import sys
+from typing import Dict, List, Set, Tuple
 
-DEFAULT_GAME_PATH = Path("/home/jeff/ExpanDrive/Google Drive/Games/ZCode/advent.z5")
-DEFAULT_EPISODES = 20000
-DEFAULT_MAX_STEPS = 200
-DEFAULT_WALKTHROUGH_STEPS = 500
+import jericho
 
-# --------------------------------------------------
-# 1. Custom Text Adventure Environment Wrapper
-# --------------------------------------------------
-class FrotzEnv:
-    def __init__(self, game_path=None, frotz_bin="dfrotz"):
-        self.frotz_bin = shutil.which(frotz_bin) or frotz_bin
-        if not shutil.which(frotz_bin) and not Path(frotz_bin).exists():
-            raise FileNotFoundError(
-                f"Frotz executable '{frotz_bin}' was not found. Install frotz or pass --frotz-bin with the correct path."
-            )
-        self.game_path = self._resolve_game_path(game_path)
-        self.child = None
+# Suppress repetitive unsupported game warnings
+import warnings
+warnings.filterwarnings("ignore", message=".*not fully supported.*")
+warnings.filterwarnings("ignore", message=".*Unable to find valid actions.*")
 
-        # Action space: Basic navigation & interaction commands
-        self.action_space = [
-            "look", "inventory", "north", "south", "east", "west",
-            "up", "down", "in", "out", "take all", "drop all",
-            "open door", "examine lamp", "take lamp", "light lamp", "score"
-        ]
+# ---------------------------------------------------------------------------
+# Configuration & Constants
+# ---------------------------------------------------------------------------
+CHECKPOINT_FILE = "q_checkpoint.pkl.gz"
+GRAPH_FILE = "advent_world_graph.json.gz"
+EPISODE_LOG_FILE = "recent_episodes.txt.gz"
+MAX_LOG_LINES = 1000
 
-    def _resolve_game_path(self, game_path=None):
-        candidates = []
+CARDINAL_DIRECTIONS = [
+    "north", "south", "east", "west", "northeast", "northwest",
+    "southeast", "southwest", "up", "down", "in", "out", "enter", "exit"
+]
 
-        if game_path is not None:
-            candidates.append(Path(game_path))
-        else:
-            candidates.append(DEFAULT_GAME_PATH)
+REJECTION_PHRASES = (
+    "you can't", "you don't", "you are unable", "what do you",
+    "i don't think", "welcome to", "interactive original", "release",
+    "the stream flows", "but you aren't", "the pipes are", "you can only go"
+)
 
-        default_names = ["Advent.z5", "advent.z5", "advent.z8", "Advent.z8"]
-        for name in default_names:
-            candidates.append(Path.cwd() / name)
-            candidates.append(Path.cwd() / "IFGamePlayer" / name)
-
-        root = Path.cwd()
-        for pattern in ("*.z1", "*.z2", "*.z3", "*.z4", "*.z5", "*.z6", "*.z7", "*.z8"):
-            candidates.extend(sorted(root.rglob(pattern)))
-
-        seen = set()
-        for candidate in candidates:
-            resolved = candidate.expanduser().resolve()
-            if resolved.is_file() and resolved not in seen:
-                seen.add(resolved)
-                return str(resolved)
-
-        raise FileNotFoundError(
-            "No Z-machine game file was found. Place a game such as Advent.z5 in the project root or pass game_path explicitly."
-        )
-
-    def reset(self):
-        if self.child and self.child.isalive():
-            self.child.close()
-
-        # Spawn dfrotz non-interactively using argument list to avoid shell quoting issues.
-        self.child = pexpect.spawn(self.frotz_bin, [self.game_path], encoding='utf-8', timeout=2)
-        self.child.expect('>')  # Wait for command prompt
-        raw_output = self.child.before
-
-        return self._clean_text(raw_output)
-
-    def step(self, action_str):
-        if not self.child or not self.child.isalive():
-            raise RuntimeError("Environment terminal or not initialized.")
-
-        # Send action to frotz
-        self.child.sendline(action_str)
-        self.child.expect('>')
-        output = self._clean_text(self.child.before)
-
-        # Retrieve score to build reward signal
-        score = self._get_score()
-        score_delta = float(score) - getattr(self, 'last_score', 0)
-        self.last_score = score
-
-        reward = score_delta * 2.0
-        if reward == 0:
-            reward = -0.05
-
-        done = False
-        lower_output = output.lower()
-        if "you have died" in lower_output:
-            reward -= 10.0
-            done = True
-        elif "you win" in lower_output:
-            reward += 50.0
-            done = True
-
-        return output, reward, done, {}
-
-    def _get_score(self):
-        """Query score silently from game state."""
+# ---------------------------------------------------------------------------
+# Compressed Logging & Episode Tracking Helpers
+# ---------------------------------------------------------------------------
+def append_rolling_log_gz(filename: str, log_line: str, max_lines: int = MAX_LOG_LINES):
+    """Appends a log entry to a gzipped log file while keeping a rolling max line limit."""
+    lines = []
+    if os.path.exists(filename):
         try:
-            self.child.sendline("score")
-            self.child.expect('>')
-            score_text = self.child.before
-            match = re.search(r'score of (\d+)', score_text, re.IGNORECASE)
+            with gzip.open(filename, "rt", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception:
+            lines = []
+            
+    lines.append(log_line + "\n")
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        
+    with gzip.open(filename, "wt", encoding="utf-8") as f:
+        f.writelines(lines)
+
+def get_last_episode_number(filename: str) -> int:
+    """Reads the last completed episode number from the gzipped log file."""
+    if not os.path.exists(filename):
+        return 0
+    try:
+        with gzip.open(filename, "rt", encoding="utf-8") as f:
+            lines = [line.strip() for line in f.readlines() if line.strip()]
+            if not lines:
+                return 0
+            last_line = lines[-1]
+            match = re.search(r"\[EPISODE\s+(\d+)\]", last_line)
             if match:
                 return int(match.group(1))
+    except Exception:
+        pass
+    return 0
+
+# ---------------------------------------------------------------------------
+# Graph & State Representation
+# ---------------------------------------------------------------------------
+class RoomNode:
+    def __init__(self, room_id: str, title: str):
+        self.room_id = room_id
+        self.title = title
+        self.items: Set[str] = set()
+        self.blocked_actions: Set[str] = set()
+        self.lifetime_visits: int = 0
+
+    def to_dict(self):
+        return {
+            "room_id": self.room_id,
+            "title": self.title,
+            "items": list(self.items),
+            "blocked_actions": list(self.blocked_actions),
+            "lifetime_visits": self.lifetime_visits,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        node = cls(data["room_id"], data["title"])
+        node.items = set(data.get("items", []))
+        node.blocked_actions = set(data.get("blocked_actions", []))
+        node.lifetime_visits = data.get("lifetime_visits", 0)
+        return node
+
+class WorldGraph:
+    def __init__(self):
+        self.nodes: Dict[str, RoomNode] = {}
+        self.transitions: Set[Tuple[str, str, str]] = set()  # (from_id, action, to_id)
+        self.current_room_id: str = None
+
+    def get_or_create_node(self, room_id: str, title: str) -> RoomNode:
+        if room_id not in self.nodes:
+            self.nodes[room_id] = RoomNode(room_id, title)
+        elif title and not self.nodes[room_id].title.strip():
+            self.nodes[room_id].title = title
+        return self.nodes[room_id]
+
+    def add_transition(self, from_id: str, action: str, to_id: str):
+        self.transitions.add((from_id, action, to_id))
+
+    def save(self, filepath: str = GRAPH_FILE):
+        data = {
+            "nodes": {rid: node.to_dict() for rid, node in self.nodes.items()},
+            "transitions": [list(t) for t in self.transitions],
+        }
+        with gzip.open(filepath, "wt", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def load(self, filepath: str = GRAPH_FILE):
+        target_path = filepath
+        if not os.path.exists(target_path) and os.path.exists("advent_world_graph.json"):
+            target_path = "advent_world_graph.json"
+
+        if not os.path.exists(target_path):
+            return
+
+        try:
+            if target_path.endswith(".gz"):
+                with gzip.open(target_path, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+
+            for rid, ndata in data.get("nodes", {}).items():
+                self.nodes[rid] = RoomNode.from_dict(ndata)
+            self.transitions = {tuple(t) for t in data.get("transitions", [])}
         except Exception:
             pass
-        return 0
 
-    def _clean_text(self, text):
-        """Remove control characters and standard prompt noise."""
-        lines = text.splitlines()
-        cleaned = [l.strip() for l in lines if l.strip() and not l.strip().startswith('>')]
-        return " ".join(cleaned)
+# ---------------------------------------------------------------------------
+# Jericho Agent with Novelty-Driven Exploration
+# ---------------------------------------------------------------------------
+class JerichoAgent:
+    def __init__(self, alpha=0.2, gamma=0.95, epsilon=0.2, beta=1.0):
+        self.graph = WorldGraph()
+        self.graph.load()
+        self.q_table: Dict[Tuple[str, str], float] = {}
+        self.state_action_counts: Dict[Tuple[str, str], int] = {}
+        self.episode_visits: Dict[str, int] = {}
+        self.last_action: str = None
 
-    def close(self):
-        if self.child and self.child.isalive():
-            self.child.close()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.beta = beta
 
-# --------------------------------------------------
-# 2. DQN Neural Network & Replay Buffer
-# --------------------------------------------------
-class QNetwork(nn.Module):
-    def __init__(self, state_dim, num_actions):
-        super(QNetwork, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, num_actions)
-        )
+        self.load_q_checkpoint()
 
-    def forward(self, x):
-        return self.fc(x)
+    def load_q_checkpoint(self, filepath: str = CHECKPOINT_FILE):
+        if os.path.exists(filepath):
+            try:
+                with gzip.open(filepath, "rb") as f:
+                    data = pickle.load(f)
+                    if isinstance(data, dict):
+                        self.q_table = data.get("q_table", data)
+                        self.state_action_counts = data.get("counts", {})
+            except Exception:
+                pass
 
-ReplayBuffer = collections.deque(maxlen=2000)
+    def save_q_checkpoint(self, filepath: str = CHECKPOINT_FILE):
+        with gzip.open(filepath, "wb") as f:
+            pickle.dump({"q_table": self.q_table, "counts": self.state_action_counts}, f)
 
-# --------------------------------------------------
-# 3. Training Loop
-# --------------------------------------------------
-def train_dqn(game_path=None, frotz_bin="dfrotz", episodes=DEFAULT_EPISODES, max_steps_per_ep=DEFAULT_MAX_STEPS):
-    env = FrotzEnv(game_path=game_path, frotz_bin=frotz_bin)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    def start_episode(self):
+        self.episode_visits.clear()
+        self.graph.current_room_id = None
+        self.last_action = None
 
-    encoder = SentenceTransformer('all-MiniLM-L6-v2').to(device)
-    state_dim = 384
-    num_actions = len(env.action_space)
+    def get_state_key_and_title(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, str]:
+        room_title = ""
 
-    gamma = 0.99
-    epsilon = 1.0
-    epsilon_min = 0.05
-    epsilon_decay = 0.995
-    lr = 1e-3
-    batch_size = 32
+        # 1. Try Jericho RAM location
+        try:
+            loc_obj = env.get_player_location()
+            if loc_obj is not None:
+                if hasattr(loc_obj, "num"):
+                    room_id = f"room_{loc_obj.num}"
+                    title = loc_obj.name.strip() if hasattr(loc_obj, "name") and loc_obj.name else f"Room {loc_obj.num}"
+                    return room_id, title
+                elif hasattr(loc_obj, "name") and loc_obj.name:
+                    room_title = loc_obj.name.strip()
+        except Exception:
+            pass
 
-    q_net = QNetwork(state_dim, num_actions).to(device)
-    target_net = QNetwork(state_dim, num_actions).to(device)
-    target_net.load_state_dict(q_net.state_dict())
-    optimizer = optim.Adam(q_net.parameters(), lr=lr)
+        # 2. Text observation parsing fallback
+        if not room_title:
+            lines = [line.strip() for line in observation.strip().split("\n") if line.strip()]
+            for line in lines:
+                if not any(phrase in line.lower() for phrase in REJECTION_PHRASES):
+                    if len(line) < 50 and not line.endswith((".", "?", "!")):
+                        room_title = line
+                        break
 
-    try:
-        for ep in range(episodes):
-            state_text = env.reset()
-            state_emb = encoder.encode(state_text, convert_to_tensor=True, device=device).detach()
-            total_reward = 0.0
+        # 3. Movement error / unchanged location fallback
+        if not room_title:
+            if self.graph.current_room_id and self.graph.current_room_id in self.graph.nodes:
+                return self.graph.current_room_id, self.graph.nodes[self.graph.current_room_id].title
+            else:
+                room_title = "At End Of Road"
 
-            for step in range(max_steps_per_ep):
-                if random.random() < epsilon:
-                    action_idx = random.randint(0, num_actions - 1)
-                else:
-                    with torch.no_grad():
-                        q_values = q_net(state_emb.unsqueeze(0))
-                        action_idx = torch.argmax(q_values).item()
+        room_id = hashlib.md5(room_title.encode("utf-8")).hexdigest()[:10]
+        return room_id, room_title
 
-                action_str = env.action_space[action_idx]
-                next_state_text, reward, done, _ = env.step(action_str)
-                next_state_emb = encoder.encode(next_state_text, convert_to_tensor=True, device=device).detach()
+    def process_step(self, env: jericho.FrotzEnv, observation: str) -> Tuple[str, str, List[str]]:
+        room_id, room_title = self.get_state_key_and_title(env, observation)
+        node = self.graph.get_or_create_node(room_id, room_title)
 
-                ReplayBuffer.append((state_emb, action_idx, reward, next_state_emb, done))
-                state_emb = next_state_emb
-                total_reward += reward
+        # Extract surrounding RAM objects
+        surrounding_items = []
+        try:
+            surrounding = env.get_surrounding_objects()
+            loc_obj = env.get_player_location()
+            loc_num = loc_obj.num if loc_obj else -1
+            
+            for obj in surrounding:
+                if hasattr(obj, "name") and obj.name and obj.num != loc_num:
+                    node.items.add(obj.name)
+                    surrounding_items.append(obj.name)
+        except Exception:
+            pass
 
-                if len(ReplayBuffer) >= batch_size:
-                    batch = random.sample(ReplayBuffer, batch_size)
-                    s_b, a_b, r_b, ns_b, d_b = zip(*batch)
+        node.lifetime_visits += 1
+        self.episode_visits[room_id] = self.episode_visits.get(room_id, 0) + 1
 
-                    s_b = torch.stack(s_b).to(device)
-                    a_b = torch.tensor(a_b, dtype=torch.long, device=device).unsqueeze(1)
-                    r_b = torch.tensor(r_b, dtype=torch.float32, device=device).unsqueeze(1)
-                    ns_b = torch.stack(ns_b).to(device)
-                    d_b = torch.tensor(d_b, dtype=torch.float32, device=device).unsqueeze(1)
+        # Track transitions
+        if self.graph.current_room_id and self.last_action:
+            if self.graph.current_room_id != room_id:
+                self.graph.add_transition(
+                    from_id=self.graph.current_room_id,
+                    action=self.last_action,
+                    to_id=room_id
+                )
+            else:
+                prev_node = self.graph.nodes[self.graph.current_room_id]
+                prev_node.blocked_actions.add(self.last_action)
 
-                    current_q = q_net(s_b).gather(1, a_b)
-                    max_next_q = target_net(ns_b).max(1)[0].unsqueeze(1)
-                    target_q = r_b + (1 - d_b) * gamma * max_next_q
+        self.graph.current_room_id = room_id
 
-                    loss = nn.MSELoss()(current_q, target_q.detach())
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+        # Get valid action space
+        try:
+            valid_actions = env.get_valid_actions()
+        except Exception:
+            valid_actions = []
 
-                if done:
-                    break
+        if not valid_actions:
+            valid_actions = [a for a in CARDINAL_DIRECTIONS if a not in node.blocked_actions]
 
-            epsilon = max(epsilon_min, epsilon * epsilon_decay)
-            if ep % 5 == 0:
-                target_net.load_state_dict(q_net.state_dict())
+        # Inject RAM item verbs
+        item_actions = []
+        for item in surrounding_items:
+            item_actions.extend([f"take {item}", f"get {item}", f"examine {item}"])
 
-            print(f"Episode {ep + 1}/{episodes} | Total Reward: {total_reward:.2f} | Epsilon: {epsilon:.2f}")
-    finally:
-        env.close()
+        # Inject Contextual Adventure Actions (Solves early-game puzzle sequence)
+        context_actions = []
+        rt_lower = room_title.lower()
+        if "building" in rt_lower:
+            context_actions.extend(["take keys", "take lamp", "take lantern", "take food", "take bottle", "xyzzy"])
+        elif "grate" in rt_lower:
+            context_actions.extend(["unlock grate", "open grate", "unlock grate with keys", "down"])
 
-    return q_net, encoder, device
+        candidate_actions = list(set(valid_actions + item_actions + context_actions))
+        action = self._select_action(node.room_id, candidate_actions)
+        self.last_action = action
 
+        return room_id, action, candidate_actions
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Train a DQN agent on an IF game via Frotz.")
-    parser.add_argument("--game-path", type=str, default=None, help="Path to the Z-machine game file, e.g. Advent.z5")
-    parser.add_argument("--frotz-bin", type=str, default="dfrotz", help="Path or name of the dfrotz executable")
-    parser.add_argument("--episodes", type=int, default=DEFAULT_EPISODES, help="Number of training episodes to run")
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Max steps per training episode")
-    parser.add_argument("--walkthrough-steps", type=int, default=DEFAULT_WALKTHROUGH_STEPS, help="Max steps to use during the final learned walkthrough")
-    parser.add_argument("--smoke-test", action="store_true", help="Run a single look command instead of the full training + walkthrough")
-    parser.add_argument("--long-run", action="store_true", help="Use a weekend-scale default configuration for extended training")
-    return parser.parse_args()
+    def _select_action(self, room_id: str, valid_actions: List[str]) -> str:
+        if not valid_actions:
+            valid_actions = CARDINAL_DIRECTIONS
 
+        if random.random() < self.epsilon:
+            return random.choice(valid_actions)
 
-def play_walkthrough(env, q_net, encoder, device, max_steps=DEFAULT_MAX_STEPS):
-    print("\n--- STARTING FULL WALKTHROUGH ---\n")
-    q_net.eval()
-    state_text = env.reset()
-    print(f"[Initial Observation]: {state_text}\n")
+        q_vals = [self.q_table.get((room_id, a), 0.0) for a in valid_actions]
+        max_q = max(q_vals)
+        best_actions = [a for a, q in zip(valid_actions, q_vals) if q == max_q]
+        return random.choice(best_actions)
 
-    total_reward = 0.0
-    for step in range(1, max_steps + 1):
-        state_emb = encoder.encode(state_text, convert_to_tensor=True, device=device).detach()
-        with torch.no_grad():
-            q_values = q_net(state_emb.unsqueeze(0))
-            action_idx = torch.argmax(q_values).item()
+    def update_q(self, state: str, action: str, env_reward: float, next_state: str, valid_next_actions: List[str]):
+        sa_key = (state, action)
+        self.state_action_counts[sa_key] = self.state_action_counts.get(sa_key, 0) + 1
+        visit_count = self.state_action_counts[sa_key]
 
-        action_str = env.action_space[action_idx]
-        next_state_text, reward, done, _ = env.step(action_str)
-        total_reward += reward
+        intrinsic_reward = self.beta / math.sqrt(visit_count)
+        loop_penalty = -0.1 if self.episode_visits.get(next_state, 0) > 1 else 0.0
+        total_reward = env_reward + intrinsic_reward + loop_penalty
 
-        print(f"Step {step} | Action: '{action_str}' | Reward: {reward:.2f}")
-        print(f"Game Response: {next_state_text}\n")
+        old_q = self.q_table.get(sa_key, 0.0)
+        max_next_q = max([self.q_table.get((next_state, a), 0.0) for a in valid_next_actions], default=0.0)
+        new_q = old_q + self.alpha * (total_reward + self.gamma * max_next_q - old_q)
+        self.q_table[sa_key] = new_q
 
-        state_text = next_state_text
+# ---------------------------------------------------------------------------
+# Execution & Statistics View
+# ---------------------------------------------------------------------------
+def print_graph_stats():
+    graph = WorldGraph()
+    graph.load()
+
+    print("==================================================")
+    print("        IFGamePlayer World Graph Statistics       ")
+    print("==================================================")
+    print(f"Total Unique Rooms Mapped : {len(graph.nodes)}")
+    print(f"Total Mapped Transitions : {len(graph.transitions)}")
+    
+    all_items = set()
+    for node in graph.nodes.values():
+        all_items.update(node.items)
+    print(f"Unique Items Discovered  : {len(all_items)}")
+    print("==================================================\n")
+
+    print(f"{'ID':<12} | {'Visits':<8} | {'Exits':<5} | Title / Items")
+    print("-" * 65)
+
+    sorted_nodes = sorted(graph.nodes.values(), key=lambda n: n.lifetime_visits, reverse=True)
+    for node in sorted_nodes:
+        out_exits = sum(1 for t in graph.transitions if t[0] == node.room_id)
+        title_str = node.title if node.title else "Unknown Room"
+        if node.items:
+            title_str += f" (Items: {', '.join(node.items)})"
+        print(f"{node.room_id:<12} | {node.lifetime_visits:<8} | {out_exits:<5} | {title_str}")
+
+def run_jericho_episode(rom_path: str, agent: JerichoAgent, max_steps: int = 300):
+    env = jericho.FrotzEnv(rom_path)
+    obs, info = env.reset()
+    agent.start_episode()
+
+    total_score = 0
+    actions_taken = []
+
+    for step in range(max_steps):
+        curr_room_id, action, candidates = agent.process_step(env, obs)
+        actions_taken.append(action)
+
+        obs, reward, done, info = env.step(action)
+        total_score += reward
+
+        next_room_id, _ = agent.get_state_key_and_title(env, obs)
+        try:
+            next_valid = env.get_valid_actions()
+        except Exception:
+            next_valid = CARDINAL_DIRECTIONS
+
+        agent.update_q(curr_room_id, action, reward, next_room_id, next_valid)
+
         if done:
-            print("--- GAME ENDED ---")
             break
 
-    print(f"Walkthrough Finished | Cumulative Reward: {total_reward:.2f}\n")
+    env.close()
+    return done, len(actions_taken), total_score, actions_taken
 
+def main():
+    parser = argparse.ArgumentParser(description="IFGamePlayer Agent")
+    parser.add_argument("--view", action="store_true", help="Display world graph statistics and exit")
+    parser.add_argument("--rom", type=str, default="advent.z5", help="Path to Z-machine ROM")
+    parser.add_argument("--episodes", type=int, default=1000, help="Number of episodes to run from current checkpoint")
+    args = parser.parse_args()
+
+    if args.view:
+        print_graph_stats()
+        return
+
+    if not os.path.exists(args.rom):
+        print(f"ROM file '{args.rom}' not found.")
+        sys.exit(1)
+
+    agent = JerichoAgent()
+    
+    # Pick up with episode counts naturally from existing logs
+    start_ep = get_last_episode_number(EPISODE_LOG_FILE) + 1
+    end_ep = start_ep + args.episodes - 1
+
+    try:
+        for ep in range(start_ep, end_ep + 1):
+            won, steps_used, score, actions = run_jericho_episode(args.rom, agent)
+            
+            mapped_count = len(agent.graph.nodes)
+            trans_count = len(agent.graph.transitions)
+            log_line = f"[EPISODE {ep:05d}] | Mapped Rooms: {mapped_count:2d} | Transitions: {trans_count:3d} | Score: {score:3.0f} | Steps: {steps_used:3d}"
+            print(log_line)
+            append_rolling_log_gz(EPISODE_LOG_FILE, log_line)
+
+            if ep % 50 == 0:
+                agent.graph.save()
+                agent.save_q_checkpoint()
+
+    except KeyboardInterrupt:
+        print("\nStopping training. Saving checkpoints...")
+    finally:
+        agent.graph.save()
+        agent.save_q_checkpoint()
+        print("Checkpoints saved successfully.")
 
 if __name__ == "__main__":
-    args = parse_args()
-    if args.long_run:
-        args.episodes = max(args.episodes, DEFAULT_EPISODES)
-        args.max_steps = max(args.max_steps, DEFAULT_MAX_STEPS)
-        args.walkthrough_steps = max(args.walkthrough_steps, DEFAULT_WALKTHROUGH_STEPS)
-
-    game_path = args.game_path or str(DEFAULT_GAME_PATH)
-
-    if args.smoke_test:
-        env = FrotzEnv(game_path=game_path, frotz_bin=args.frotz_bin)
-        try:
-            print("\n--- STARTING ENVIRONMENT SMOKE TEST ---\n")
-            state_text = env.reset()
-            print(f"[Initial Observation]: {state_text}\n")
-            action_str = "look"
-            next_state_text, reward, done, _ = env.step(action_str)
-            print(f"Action: '{action_str}' | Reward: {reward:.2f}")
-            print(f"Game Response: {next_state_text}\n")
-        finally:
-            env.close()
-    else:
-        q_net, encoder, device = train_dqn(game_path=game_path, frotz_bin=args.frotz_bin, episodes=args.episodes, max_steps_per_ep=args.max_steps)
-        env = FrotzEnv(game_path=game_path, frotz_bin=args.frotz_bin)
-        try:
-            play_walkthrough(env, q_net, encoder, device, max_steps=args.walkthrough_steps)
-        finally:
-            env.close()
+    main()
