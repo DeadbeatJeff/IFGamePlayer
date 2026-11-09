@@ -100,14 +100,27 @@ def train_agent():
             if score > global_best_score or len(episode_rooms) > 5:
                 global_best_score = max(global_best_score, score)
                 current_state = env.get_state()
-                state_bytes_key = current_state.tobytes()
+                
+                # Safely generate a unique key regardless of whether state is a tuple, array, or bytes
+                if isinstance(current_state, tuple):
+                    state_bytes_key = str(current_state).encode('utf-8')
+                elif hasattr(current_state, 'tobytes'):
+                    state_bytes_key = current_state.tobytes()
+                else:
+                    state_bytes_key = str(current_state).encode('utf-8')
                 
                 if state_bytes_key not in state_checkpoint_keys:
                     state_checkpoint_buffer.append(current_state)
                     state_checkpoint_keys.add(state_bytes_key)
                     if len(state_checkpoint_buffer) > 50:
                         old_state = state_checkpoint_buffer.pop(0)
-                        state_checkpoint_keys.remove(old_state.tobytes())
+                        if isinstance(old_state, tuple):
+                            old_key = str(old_state).encode('utf-8')
+                        elif hasattr(old_state, 'tobytes'):
+                            old_key = old_state.tobytes()
+                        else:
+                            old_key = str(old_state).encode('utf-8')
+                        state_checkpoint_keys.discard(old_key)
 
             if done:
                 break
