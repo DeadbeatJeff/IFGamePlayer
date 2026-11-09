@@ -4,7 +4,7 @@ from collections import deque
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from jericho import FrotzEnv, load_world_commands
+from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION & HYPERPARAMETERS ---
 ROM_PATH = "advent.z5"
@@ -17,7 +17,6 @@ EPS_END = 0.05
 EPS_DECAY_EPISODES = 200000  # Linear decay over 200k episodes, then holds at 0.05
 
 # --- 2. CURRICULUM STATE BUFFER ---
-# Stores successful deep states (bytes) for restarting episodes midway
 state_checkpoint_buffer = []
 
 def get_epsilon(episode):
@@ -27,9 +26,7 @@ def get_epsilon(episode):
 
 def train_agent():
     env = FrotzEnv(ROM_PATH)
-    valid_actions = load_world_commands(ROM_PATH)
     
-    # Example tracking metrics
     visited_rooms = set()
     global_best_score = 0
 
@@ -44,10 +41,7 @@ def train_agent():
         epsilon = get_epsilon(episode)
         episode_score = 0
         
-        # Track recent actions to penalize loops (e.g., inventory <-> look)
         recent_actions = deque(maxlen=4)
-        
-        # Track visited room signatures for intrinsic novelty reward
         episode_rooms = set()
 
         for step in range(MAX_STEPS):
@@ -59,11 +53,9 @@ def train_agent():
             if random.random() < epsilon:
                 action = random.choice(legal_actions)
             else:
-                # Replace with your Q-network argmax action selection
                 action = select_greedy_action(env, legal_actions)
 
             # --- ACTION REPETITION / LOOP PENALTY ---
-            # If the agent is cycling the exact same 2 actions, force a random exploration step
             recent_actions.append(action)
             is_looping = len(recent_actions) == 4 and recent_actions[0] == recent_actions[2] and recent_actions[1] == recent_actions[3]
             if is_looping:
@@ -73,31 +65,23 @@ def train_agent():
             obs, score, done, info = env.step(action)
             
             # --- INTRINSIC NOVELTY REWARD ---
-            # Get current room or state description hash to reward exploring new territory
             current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else obs[:50]
             intrinsic_reward = 0.0
             if current_room not in visited_rooms:
                 visited_rooms.add(current_room)
                 episode_rooms.add(current_room)
-                intrinsic_reward = 0.1  # Small bonus for discovering unmapped states
+                intrinsic_reward = 0.1
 
-            # Total reward signal combines game score delta + intrinsic curiosity
             reward = (score - episode_score) + intrinsic_reward
             episode_score = score
 
-            # Store states where the agent achieved a higher score or explored deep rooms
             if score > global_best_score or len(episode_rooms) > 15:
                 global_best_score = max(global_best_score, score)
                 current_state_bytes = env.get_state()
                 if current_state_bytes not in state_checkpoint_buffer:
                     state_checkpoint_buffer.append(current_state_bytes)
-                    # Keep buffer size manageable
-                    if len(state_checkpoint_buffer > 50):
+                    if len(state_checkpoint_buffer) > 50:
                         state_checkpoint_buffer.pop(0)
-
-            # --- UPDATE YOUR MODEL HERE ---
-            # loss = compute_loss(state, action, reward, next_state)
-            # optimizer.zero_grad(); loss.backward(); optimizer.step()
 
             if done:
                 break
@@ -106,7 +90,6 @@ def train_agent():
             print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Transitions: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
 
 def select_greedy_action(env, legal_actions):
-    # Stub for your neural network forward pass selecting max Q-value action
     return random.choice(legal_actions)
 
 if __name__ == "__main__":
