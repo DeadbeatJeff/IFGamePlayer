@@ -17,6 +17,14 @@ EPS_START = 1.0
 EPS_END = 0.05
 EPS_DECAY_EPISODES = 200000
 
+# Standard fallback action vocabulary for unsupported ROMs where get_valid_actions() fails
+FALLBACK_ACTIONS = [
+    "north", "south", "east", "west", "up", "down", "in", "out",
+    "look", "inventory", "score", "help", "take inventory",
+    "take keys", "take lantern", "take food", "take bottle",
+    "light lamp", "unlock door", "open door", "examine room", "sw", "se", "nw", "ne"
+]
+
 # --- 2. CURRICULUM STATE BUFFER ---
 state_checkpoint_buffer = []
 
@@ -53,10 +61,10 @@ def train_agent():
         episode_rooms = set()
 
         for step in range(MAX_STEPS):
-            # Corrected method name: get_valid_actions()
+            # Fetch valid actions; use FALLBACK_ACTIONS if Jericho returns empty for unsupported ROM
             legal_actions = env.get_valid_actions()
             if not legal_actions:
-                break
+                legal_actions = FALLBACK_ACTIONS
 
             # Epsilon-greedy action selection with loop avoidance
             if random.random() < epsilon:
@@ -83,12 +91,12 @@ def train_agent():
             if current_room not in visited_rooms:
                 visited_rooms.add(current_room)
                 episode_rooms.add(current_room)
-                intrinsic_reward = 0.1  # Curiosity bonus to drive exploration past room 22
+                intrinsic_reward = 0.1
 
             reward = (score - episode_score) + intrinsic_reward
             episode_score = score
 
-            if score > global_best_score or len(episode_rooms) > 15:
+            if score > global_best_score or len(episode_rooms) > 5:
                 global_best_score = max(global_best_score, score)
                 current_state_bytes = env.get_state()
                 if current_state_bytes not in state_checkpoint_buffer:
@@ -99,7 +107,8 @@ def train_agent():
             if done:
                 break
 
-        if episode % 1000 == 0:
+        # Changed to print every 100 episodes for more frequent progress visibility
+        if episode % 100 == 0:
             print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
 
 def select_greedy_action(env, legal_actions):
