@@ -27,6 +27,7 @@ FALLBACK_ACTIONS = [
 
 # --- 2. CURRICULUM STATE BUFFER ---
 state_checkpoint_buffer = []
+state_checkpoint_keys = set()
 
 def get_epsilon(episode):
     if episode >= EPS_DECAY_EPISODES:
@@ -98,16 +99,19 @@ def train_agent():
 
             if score > global_best_score or len(episode_rooms) > 5:
                 global_best_score = max(global_best_score, score)
-                current_state_bytes = env.get_state()
-                if current_state_bytes not in state_checkpoint_buffer:
-                    state_checkpoint_buffer.append(current_state_bytes)
+                current_state = env.get_state()
+                state_bytes_key = current_state.tobytes()
+                
+                if state_bytes_key not in state_checkpoint_keys:
+                    state_checkpoint_buffer.append(current_state)
+                    state_checkpoint_keys.add(state_bytes_key)
                     if len(state_checkpoint_buffer) > 50:
-                        state_checkpoint_buffer.pop(0)
+                        old_state = state_checkpoint_buffer.pop(0)
+                        state_checkpoint_keys.remove(old_state.tobytes())
 
             if done:
                 break
 
-        # Changed to print every 100 episodes for more frequent progress visibility
         if episode % 100 == 0:
             print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
 
