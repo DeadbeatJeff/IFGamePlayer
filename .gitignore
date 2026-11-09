@@ -36,3 +36,6 @@ Thumbs.db
 
 # Game files
 advent.z5
+
+# GZip Files
+.gz
