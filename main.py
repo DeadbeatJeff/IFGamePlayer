@@ -1,5 +1,6 @@
 import os
 import random
+import re
 from collections import deque
 import torch
 import torch.nn as nn
@@ -11,10 +12,10 @@ ROM_PATH = "advent.z5"
 MAX_STEPS = 300
 TOTAL_EPISODES = 500000
 
-# Epsilon schedule with a persistent floor so exploration never completely dies
+# Epsilon schedule with a persistent floor so exploration never dies out
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY_EPISODES = 200000  # Linear decay over 200k episodes, then holds at 0.05
+EPS_DECAY_EPISODES = 200000
 
 # --- 2. CURRICULUM STATE BUFFER ---
 state_checkpoint_buffer = []
@@ -23,6 +24,13 @@ def get_epsilon(episode):
     if episode >= EPS_DECAY_EPISODES:
         return EPS_END
     return EPS_START - (EPS_START - EPS_END) * (episode / EPS_DECAY_EPISODES)
+
+def parse_score_from_text(obs, fallback_score):
+    """Fallback text parser for unsupported ROMs where RAM score tracking is disabled."""
+    match = re.search(r'score[:\s]+(\d+)', obs, re.IGNORECASE)
+    if match:
+        return int(match.group(1))
+    return fallback_score
 
 def train_agent():
     env = FrotzEnv(ROM_PATH)
@@ -33,7 +41,7 @@ def train_agent():
     for episode in range(1, TOTAL_EPISODES + 1):
         env.reset()
         
-        # Curriculum Learning: 30% chance to spawn from a saved deep-state checkpoint if available
+        # Curriculum Learning: 30% chance to spawn from a saved deep-state checkpoint
         if state_checkpoint_buffer and random.random() < 0.3:
             saved_state = random.choice(state_checkpoint_buffer)
             env.set_state(saved_state)
@@ -45,7 +53,8 @@ def train_agent():
         episode_rooms = set()
 
         for step in range(MAX_STEPS):
-            legal_actions = env.get_actions()
+            # Corrected method name: get_valid_actions()
+            legal_actions = env.get_valid_actions()
             if not legal_actions:
                 break
 
@@ -64,13 +73,17 @@ def train_agent():
             # Step environment
             obs, score, done, info = env.step(action)
             
+            # If RAM score tracking is disabled for advent.z5, parse score from observation text
+            if score == 0:
+                score = parse_score_from_text(obs, episode_score)
+
             # --- INTRINSIC NOVELTY REWARD ---
             current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else obs[:50]
             intrinsic_reward = 0.0
             if current_room not in visited_rooms:
                 visited_rooms.add(current_room)
                 episode_rooms.add(current_room)
-                intrinsic_reward = 0.1
+                intrinsic_reward = 0.1  # Curiosity bonus to drive exploration past room 22
 
             reward = (score - episode_score) + intrinsic_reward
             episode_score = score
@@ -87,7 +100,7 @@ def train_agent():
                 break
 
         if episode % 1000 == 0:
-            print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Transitions: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
+            print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
 
 def select_greedy_action(env, legal_actions):
     return random.choice(legal_actions)
