@@ -1,10 +1,7 @@
 import os
 import random
 import re
-from collections import deque
-import torch
-import torch.nn as nn
-import torch.optim as optim
+from collections import deque, defaultdict
 from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION & HYPERPARAMETERS ---
@@ -12,7 +9,7 @@ ROM_PATH = "advent.z5"
 MAX_STEPS = 600
 TOTAL_EPISODES = 500000
 GAMMA = 0.99
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 0.1
 
 # Epsilon schedule with a persistent floor so exploration never dies out
 EPS_START = 1.0
@@ -27,47 +24,9 @@ FALLBACK_ACTIONS = [
     "light lamp", "unlock door", "open door", "examine room", "sw", "se", "nw", "ne"
 ]
 
-# --- 2. DEEP REINFORCEMENT RELEVANCE NETWORK (DRRN) ---
-class TextEmbeddingEncoder(nn.Module):
-    def __init__(self, vocab_size=10000, embed_dim=64):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.fc = nn.Linear(embed_dim, 64)
-        
-    def text_to_tensor(self, text):
-        if not isinstance(text, str):
-            text = str(text)
-        byte_tokens = list(text.encode('utf-8', errors='ignore')[:100])
-        if not byte_tokens:
-            byte_tokens = [0]
-        return torch.tensor(byte_tokens, dtype=torch.long)
-
-    def forward(self, text):
-        tokens = self.text_to_tensor(text).unsqueeze(0)
-        embedded = self.embedding(tokens).mean(dim=1)
-        return torch.relu(self.fc(embedded))
-
-class DRRN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.state_encoder = TextEmbeddingEncoder()
-        self.action_encoder = TextEmbeddingEncoder()
-        self.scorer = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, state_text, action_text):
-        s_emb = self.state_encoder(state_text)
-        a_emb = self.action_encoder(action_text)
-        combined = torch.cat([s_emb, a_emb], dim=1)
-        return self.scorer(combined)
-
-# Initialize Q-Network and Optimizer
-q_net = DRRN()
-optimizer = optim.Adam(q_net.parameters(), lr=LEARNING_RATE)
-loss_fn = nn.MSELoss()
+# --- 2. TABULAR Q-LEARNING DICTIONARY ---
+# Maps (state_substring, action) -> Q-value to bypass PyTorch autograd graph bugs
+q_table = defaultdict(float)
 
 # --- 3. CURRICULUM STATE BUFFER ---
 state_checkpoint_buffer = []
@@ -84,17 +43,21 @@ def parse_score_from_text(obs, fallback_score):
         return int(match.group(1))
     return fallback_score
 
-def select_greedy_action(state_text, legal_actions):
-    q_net.eval()
-    with torch.no_grad():
-        best_action = legal_actions[0]
-        max_q = float('-inf')
-        for action in legal_actions:
-            q_val = q_net(state_text, action).item()
-            if q_val > max_q:
-                max_q = q_val
-                best_action = action
-        return best_action
+def get_state_key(obs):
+    # Extract short descriptive key from observation text for table lookup
+    if not isinstance(obs, str):
+        obs = str(obs)
+    return obs[:60].strip()
+
+def select_greedy_action(state_key, legal_actions):
+    best_action = legal_actions[0]
+    max_q = float('-inf')
+    for action in legal_actions:
+        q_val = q_table[(state_key, action)]
+        if q_val > max_q:
+            max_q = q_val
+            best_action = action
+    return best_action
 
 def train_agent():
     env = FrotzEnv(ROM_PATH)
@@ -121,10 +84,12 @@ def train_agent():
             if not legal_actions:
                 legal_actions = FALLBACK_ACTIONS
 
+            state_key = get_state_key(obs)
+
             if random.random() < epsilon:
                 action = random.choice(legal_actions)
             else:
-                action = select_greedy_action(obs, legal_actions)
+                action = select_greedy_action(state_key, legal_actions)
 
             recent_actions.append(action)
             is_looping = len(recent_actions) == 4 and recent_actions[0] == recent_actions[2] and recent_actions[1] == recent_actions[3]
@@ -145,25 +110,17 @@ def train_agent():
 
             reward = (score - episode_score) + intrinsic_reward
             
-            # --- Q-NETWORK UPDATE (DRRN STEP) ---
-            q_net.train()
-            optimizer.zero_grad()
+            # --- Q-TABLE UPDATE (TEMPORAL DIFFERENCE) ---
+            next_state_key = get_state_key(next_obs)
+            next_legal = env.get_valid_actions()
+            if not next_legal:
+                next_legal = FALLBACK_ACTIONS
             
-            with torch.no_grad():
-                next_legal = env.get_valid_actions()
-                if not next_legal:
-                    next_legal = FALLBACK_ACTIONS
-                eval_actions = next_legal[:10] if len(next_legal) > 10 else next_legal
-                next_q_values = [q_net(next_obs, a).item() for a in eval_actions]
-                max_next_q = max(next_q_values) if next_q_values else 0.0
-                target_q = reward + (0.0 if done else GAMMA * max_next_q)
-                target_tensor = torch.tensor([[target_q]], dtype=torch.float32)
-
-            current_q = q_net(obs, action)
-
-            loss = loss_fn(current_q, target_tensor)
-            loss.backward()
-            optimizer.step()
+            max_next_q = max([q_table[(next_state_key, a)] for a in next_legal]) if next_legal else 0.0
+            
+            current_q = q_table[(state_key, action)]
+            new_q = current_q + LEARNING_RATE * (reward + GAMMA * max_next_q - current_q)
+            q_table[(state_key, action)] = new_q
 
             episode_score = score
             obs = next_obs
