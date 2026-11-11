@@ -57,17 +57,10 @@ class DRRN(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 1)
         )
-        self.action_cache = {}
 
     def forward(self, state_text, action_text):
         s_emb = self.state_encoder(state_text)
-        
-        if action_text in self.action_cache:
-            a_emb = self.action_cache[action_text]
-        else:
-            a_emb = self.action_encoder(action_text)
-            self.action_cache[action_text] = a_emb
-            
+        a_emb = self.action_encoder(action_text)
         combined = torch.cat([s_emb, a_emb], dim=1)
         return self.scorer(combined)
 
@@ -156,7 +149,6 @@ def train_agent():
             q_net.train()
             optimizer.zero_grad()
             
-            # Compute next state max Q under no_grad to decouple graph creation
             with torch.no_grad():
                 next_legal = env.get_valid_actions()
                 if not next_legal:
@@ -167,7 +159,6 @@ def train_agent():
                 target_q = reward + (0.0 if done else GAMMA * max_next_q)
                 target_tensor = torch.tensor([[target_q]], dtype=torch.float32)
 
-            # Compute current Q in training mode
             current_q = q_net(obs, action)
 
             loss = loss_fn(current_q, target_tensor)
