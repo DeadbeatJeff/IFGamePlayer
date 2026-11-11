@@ -9,7 +9,7 @@ from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION & HYPERPARAMETERS ---
 ROM_PATH = "advent.z5"
-MAX_STEPS = 600  # Increased from 300 to allow deeper maze and multi-room traversal
+MAX_STEPS = 600
 TOTAL_EPISODES = 500000
 GAMMA = 0.99
 LEARNING_RATE = 1e-4
@@ -35,6 +35,10 @@ class TextEmbeddingEncoder(nn.Module):
         self.fc = nn.Linear(embed_dim, 64)
         
     def text_to_tensor(self, text):
+        # Ensure text is a string and handle multi-line descriptions safely
+        if not isinstance(text, str):
+            text = str(text)
+        # Take up to the first 100 characters and convert each character ord safely
         tokens = [ord(c) % 9999 for c in text[:100]]
         if not tokens:
             tokens = [0]
