@@ -9,8 +9,10 @@ from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION & HYPERPARAMETERS ---
 ROM_PATH = "advent.z5"
-MAX_STEPS = 300
+MAX_STEPS = 600  # Increased from 300 to allow deeper maze and multi-room traversal
 TOTAL_EPISODES = 500000
+GAMMA = 0.99
+LEARNING_RATE = 1e-4
 
 # Epsilon schedule with a persistent floor so exploration never dies out
 EPS_START = 1.0
@@ -25,7 +27,47 @@ FALLBACK_ACTIONS = [
     "light lamp", "unlock door", "open door", "examine room", "sw", "se", "nw", "ne"
 ]
 
-# --- 2. CURRICULUM STATE BUFFER ---
+# --- 2. DEEP REINFORCEMENT RELEVANCE NETWORK (DRRN) ---
+class TextEmbeddingEncoder(nn.Module):
+    def __init__(self, vocab_size=10000, embed_dim=64):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+        self.fc = nn.Linear(embed_dim, 64)
+        
+    def text_to_tensor(self, text):
+        tokens = [ord(c) % 9999 for c in text[:100]]
+        if not tokens:
+            tokens = [0]
+        return torch.tensor(tokens, dtype=torch.long)
+
+    def forward(self, text):
+        tokens = self.text_to_tensor(text).unsqueeze(0)
+        embedded = self.embedding(tokens).mean(dim=1)
+        return torch.relu(self.fc(embedded))
+
+class DRRN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.state_encoder = TextEmbeddingEncoder()
+        self.action_encoder = TextEmbeddingEncoder()
+        self.scorer = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, state_text, action_text):
+        s_emb = self.state_encoder(state_text)
+        a_emb = self.action_encoder(action_text)
+        combined = torch.cat([s_emb, a_emb], dim=1)
+        return self.scorer(combined)
+
+# Initialize Q-Network and Optimizer
+q_net = DRRN()
+optimizer = optim.Adam(q_net.parameters(), lr=LEARNING_RATE)
+loss_fn = nn.MSELoss()
+
+# --- 3. CURRICULUM STATE BUFFER ---
 state_checkpoint_buffer = []
 state_checkpoint_keys = set()
 
@@ -41,6 +83,16 @@ def parse_score_from_text(obs, fallback_score):
         return int(match.group(1))
     return fallback_score
 
+def select_greedy_action(state_text, legal_actions):
+    q_net.eval()
+    with torch.no_grad():
+        q_values = []
+        for action in legal_actions:
+            q_val = q_net(state_text, action)
+            q_values.append(q_val.item())
+        best_idx = q_values.index(max(q_values))
+        return legal_actions[best_idx]
+
 def train_agent():
     env = FrotzEnv(ROM_PATH)
     
@@ -48,7 +100,7 @@ def train_agent():
     global_best_score = 0
 
     for episode in range(1, TOTAL_EPISODES + 1):
-        env.reset()
+        obs = env.reset()
         
         # Curriculum Learning: 30% chance to spawn from a saved deep-state checkpoint
         if state_checkpoint_buffer and random.random() < 0.3:
@@ -71,7 +123,7 @@ def train_agent():
             if random.random() < epsilon:
                 action = random.choice(legal_actions)
             else:
-                action = select_greedy_action(env, legal_actions)
+                action = select_greedy_action(obs, legal_actions)
 
             # --- ACTION REPETITION / LOOP PENALTY ---
             recent_actions.append(action)
@@ -80,14 +132,14 @@ def train_agent():
                 action = random.choice(legal_actions)
 
             # Step environment
-            obs, score, done, info = env.step(action)
+            next_obs, score, done, info = env.step(action)
             
             # If RAM score tracking is disabled for advent.z5, parse score from observation text
             if score == 0:
-                score = parse_score_from_text(obs, episode_score)
+                score = parse_score_from_text(next_obs, episode_score)
 
             # --- INTRINSIC NOVELTY REWARD ---
-            current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else obs[:50]
+            current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else next_obs[:50]
             intrinsic_reward = 0.0
             if current_room not in visited_rooms:
                 visited_rooms.add(current_room)
@@ -95,13 +147,33 @@ def train_agent():
                 intrinsic_reward = 0.1
 
             reward = (score - episode_score) + intrinsic_reward
-            episode_score = score
+            
+            # --- Q-NETWORK UPDATE (DRRN STEP) ---
+            q_net.train()
+            current_q = q_net(obs, action)
+            
+            with torch.no_grad():
+                next_legal = env.get_valid_actions()
+                if not next_legal:
+                    next_legal = FALLBACK_ACTIONS
+                next_q_values = [q_net(next_obs, a).item() for a in next_legal]
+                max_next_q = max(next_q_values) if next_q_values else 0.0
+                target_q = reward + (0.0 if done else GAMMA * max_next_q)
+                target_tensor = torch.tensor([[target_q]], dtype=torch.float32)
 
-            if score > global_best_score or len(episode_rooms) > 5:
-                global_best_score = max(global_best_score, score)
+            loss = loss_fn(current_q, target_tensor)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            episode_score = score
+            obs = next_obs
+
+            # Strictly buffer checkpoints on score improvements to filter out low-score dead ends
+            if score > global_best_score:
+                global_best_score = score
                 current_state = env.get_state()
                 
-                # Safely generate a unique key regardless of whether state is a tuple, array, or bytes
                 if isinstance(current_state, tuple):
                     state_bytes_key = str(current_state).encode('utf-8')
                 elif hasattr(current_state, 'tobytes'):
@@ -127,9 +199,6 @@ def train_agent():
 
         if episode % 100 == 0:
             print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
-
-def select_greedy_action(env, legal_actions):
-    return random.choice(legal_actions)
 
 if __name__ == "__main__":
     train_agent()
