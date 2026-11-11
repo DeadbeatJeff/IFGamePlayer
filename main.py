@@ -57,7 +57,6 @@ class DRRN(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 1)
         )
-        # Cache action embeddings to avoid redundant encoder passes
         self.action_cache = {}
 
     def forward(self, state_text, action_text):
@@ -87,7 +86,6 @@ def get_epsilon(episode):
     return EPS_START - (EPS_START - EPS_END) * (episode / EPS_DECAY_EPISODES)
 
 def parse_score_from_text(obs, fallback_score):
-    """Fallback text parser for unsupported ROMs where RAM score tracking is disabled."""
     match = re.search(r'score[:\s]+(\d+)', obs, re.IGNORECASE)
     if match:
         return int(match.group(1))
@@ -126,31 +124,25 @@ def train_agent():
         episode_rooms = set()
 
         for step in range(MAX_STEPS):
-            # Fetch valid actions; use FALLBACK_ACTIONS if Jericho returns empty for unsupported ROM
             legal_actions = env.get_valid_actions()
             if not legal_actions:
                 legal_actions = FALLBACK_ACTIONS
 
-            # Epsilon-greedy action selection with loop avoidance
             if random.random() < epsilon:
                 action = random.choice(legal_actions)
             else:
                 action = select_greedy_action(obs, legal_actions)
 
-            # --- ACTION REPETITION / LOOP PENALTY ---
             recent_actions.append(action)
             is_looping = len(recent_actions) == 4 and recent_actions[0] == recent_actions[2] and recent_actions[1] == recent_actions[3]
             if is_looping:
                 action = random.choice(legal_actions)
 
-            # Step environment
             next_obs, score, done, info = env.step(action)
             
-            # If RAM score tracking is disabled for advent.z5, parse score from observation text
             if score == 0:
                 score = parse_score_from_text(next_obs, episode_score)
 
-            # --- INTRINSIC NOVELTY REWARD ---
             current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else next_obs[:50]
             intrinsic_reward = 0.0
             if current_room not in visited_rooms:
@@ -162,28 +154,27 @@ def train_agent():
             
             # --- Q-NETWORK UPDATE (DRRN STEP) ---
             q_net.train()
+            optimizer.zero_grad()  # Ensure gradients are cleared before forward pass
+            
             current_q = q_net(obs, action)
             
             with torch.no_grad():
                 next_legal = env.get_valid_actions()
                 if not next_legal:
                     next_legal = FALLBACK_ACTIONS
-                # Limit evaluation subset for speed on unsupported ROMs
                 eval_actions = next_legal[:10] if len(next_legal) > 10 else next_legal
                 next_q_values = [q_net(next_obs, a).item() for a in eval_actions]
                 max_next_q = max(next_q_values) if next_q_values else 0.0
                 target_q = reward + (0.0 if done else GAMMA * max_next_q)
-                target_tensor = torch.tensor([[target_q]], dtype=torch.float32)
+                target_tensor = torch.tensor([[target_q]], dtype=torch.float32).detach() # Detach target to prevent graph persistence
 
             loss = loss_fn(current_q, target_tensor)
-            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             episode_score = score
             obs = next_obs
 
-            # Strictly buffer checkpoints on score improvements to filter out low-score dead ends
             if score > global_best_score:
                 global_best_score = score
                 current_state = env.get_state()
