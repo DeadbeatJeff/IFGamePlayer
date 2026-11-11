@@ -35,14 +35,13 @@ class TextEmbeddingEncoder(nn.Module):
         self.fc = nn.Linear(embed_dim, 64)
         
     def text_to_tensor(self, text):
-        # Ensure text is a string and handle multi-line descriptions safely
         if not isinstance(text, str):
             text = str(text)
-        # Take up to the first 100 characters and convert each character ord safely
-        tokens = [ord(c) % 9999 for c in text[:100]]
-        if not tokens:
-            tokens = [0]
-        return torch.tensor(tokens, dtype=torch.long)
+        # Convert directly to UTF-8 bytes to bypass character ord() limits on long strings
+        byte_tokens = list(text.encode('utf-8', errors='ignore')[:100])
+        if not byte_tokens:
+            byte_tokens = [0]
+        return torch.tensor(byte_tokens, dtype=torch.long)
 
     def forward(self, text):
         tokens = self.text_to_tensor(text).unsqueeze(0)
