@@ -49,6 +49,23 @@ def get_state_key(obs):
         obs = str(obs)
     return obs[:60].strip()
 
+def extract_dynamic_actions(obs, legal_actions):
+    """Dynamically supplement fallback actions using words found in the room description."""
+    if legal_actions and legal_actions != FALLBACK_ACTIONS:
+        return legal_actions
+    
+    # Extract potential objects/nouns mentioned in the observation text
+    words = re.findall(r'\b[a-z]{3,}\b', obs.lower())
+    common_ignore = {'the', 'and', 'you', 'are', 'with', 'that', 'this', 'from', 'have'}
+    nouns = [w for w in set(words) if w not in common_ignore]
+    
+    dynamic_actions = list(FALLBACK_ACTIONS)
+    # Add contextual interactions if nouns appear in the room text
+    for noun in nouns[:5]:
+        dynamic_actions.extend([f"take {noun}", f"examine {noun}", f"open {noun}", f"use {noun}"])
+        
+    return list(set(dynamic_actions))
+
 def select_greedy_action(state_key, legal_actions):
     best_action = legal_actions[0]
     max_q = float('-inf')
@@ -80,7 +97,8 @@ def train_agent():
         episode_rooms = set()
 
         for step in range(MAX_STEPS):
-            legal_actions = env.get_valid_actions()
+            base_actions = env.get_valid_actions()
+            legal_actions = extract_dynamic_actions(obs, base_actions)
             if not legal_actions:
                 legal_actions = FALLBACK_ACTIONS
 
