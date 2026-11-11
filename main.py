@@ -154,10 +154,9 @@ def train_agent():
             
             # --- Q-NETWORK UPDATE (DRRN STEP) ---
             q_net.train()
-            optimizer.zero_grad()  # Ensure gradients are cleared before forward pass
+            optimizer.zero_grad()
             
-            current_q = q_net(obs, action)
-            
+            # Compute next state max Q under no_grad to decouple graph creation
             with torch.no_grad():
                 next_legal = env.get_valid_actions()
                 if not next_legal:
@@ -166,7 +165,10 @@ def train_agent():
                 next_q_values = [q_net(next_obs, a).item() for a in eval_actions]
                 max_next_q = max(next_q_values) if next_q_values else 0.0
                 target_q = reward + (0.0 if done else GAMMA * max_next_q)
-                target_tensor = torch.tensor([[target_q]], dtype=torch.float32).detach() # Detach target to prevent graph persistence
+                target_tensor = torch.tensor([[target_q]], dtype=torch.float32)
+
+            # Compute current Q in training mode
+            current_q = q_net(obs, action)
 
             loss = loss_fn(current_q, target_tensor)
             loss.backward()
