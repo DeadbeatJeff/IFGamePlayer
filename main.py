@@ -37,7 +37,6 @@ class TextEmbeddingEncoder(nn.Module):
     def text_to_tensor(self, text):
         if not isinstance(text, str):
             text = str(text)
-        # Convert directly to UTF-8 bytes to bypass character ord() limits on long strings
         byte_tokens = list(text.encode('utf-8', errors='ignore')[:100])
         if not byte_tokens:
             byte_tokens = [0]
@@ -58,10 +57,18 @@ class DRRN(nn.Module):
             nn.ReLU(),
             nn.Linear(64, 1)
         )
+        # Cache action embeddings to avoid redundant encoder passes
+        self.action_cache = {}
 
     def forward(self, state_text, action_text):
         s_emb = self.state_encoder(state_text)
-        a_emb = self.action_encoder(action_text)
+        
+        if action_text in self.action_cache:
+            a_emb = self.action_cache[action_text]
+        else:
+            a_emb = self.action_encoder(action_text)
+            self.action_cache[action_text] = a_emb
+            
         combined = torch.cat([s_emb, a_emb], dim=1)
         return self.scorer(combined)
 
@@ -89,12 +96,14 @@ def parse_score_from_text(obs, fallback_score):
 def select_greedy_action(state_text, legal_actions):
     q_net.eval()
     with torch.no_grad():
-        q_values = []
+        best_action = legal_actions[0]
+        max_q = float('-inf')
         for action in legal_actions:
-            q_val = q_net(state_text, action)
-            q_values.append(q_val.item())
-        best_idx = q_values.index(max(q_values))
-        return legal_actions[best_idx]
+            q_val = q_net(state_text, action).item()
+            if q_val > max_q:
+                max_q = q_val
+                best_action = action
+        return best_action
 
 def train_agent():
     env = FrotzEnv(ROM_PATH)
@@ -159,7 +168,9 @@ def train_agent():
                 next_legal = env.get_valid_actions()
                 if not next_legal:
                     next_legal = FALLBACK_ACTIONS
-                next_q_values = [q_net(next_obs, a).item() for a in next_legal]
+                # Limit evaluation subset for speed on unsupported ROMs
+                eval_actions = next_legal[:10] if len(next_legal) > 10 else next_legal
+                next_q_values = [q_net(next_obs, a).item() for a in eval_actions]
                 max_next_q = max(next_q_values) if next_q_values else 0.0
                 target_q = reward + (0.0 if done else GAMMA * max_next_q)
                 target_tensor = torch.tensor([[target_q]], dtype=torch.float32)
