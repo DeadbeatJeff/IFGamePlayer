@@ -38,19 +38,29 @@ def get_epsilon(episode):
     return EPS_START - (EPS_START - EPS_END) * (episode / EPS_DECAY_EPISODES)
 
 def parse_score_from_text(obs, fallback_score):
+    if isinstance(obs, tuple):
+        obs = obs[0]
+    if not isinstance(obs, str):
+        obs = str(obs)
     match = re.search(r'score[:\s]+(\d+)', obs, re.IGNORECASE)
     if match:
         return int(match.group(1))
     return fallback_score
 
 def get_state_key(obs):
-    # Extract short descriptive key from observation text for table lookup
+    if isinstance(obs, tuple):
+        obs = obs[0]
     if not isinstance(obs, str):
         obs = str(obs)
     return obs[:60].strip()
 
 def extract_dynamic_actions(obs, legal_actions):
     """Dynamically supplement fallback actions using words found in the room description."""
+    if isinstance(obs, tuple):
+        obs = obs[0]
+    if not isinstance(obs, str):
+        obs = str(obs)
+        
     if legal_actions and legal_actions != FALLBACK_ACTIONS:
         return legal_actions
     
@@ -84,6 +94,8 @@ def train_agent():
 
     for episode in range(1, TOTAL_EPISODES + 1):
         obs = env.reset()
+        if isinstance(obs, tuple):
+            obs = obs[0]
         
         # Curriculum Learning: 30% chance to spawn from a saved deep-state checkpoint
         if state_checkpoint_buffer and random.random() < 0.3:
@@ -115,11 +127,13 @@ def train_agent():
                 action = random.choice(legal_actions)
 
             next_obs, score, done, info = env.step(action)
+            if isinstance(next_obs, tuple):
+                next_obs = next_obs[0]
             
             if score == 0:
                 score = parse_score_from_text(next_obs, episode_score)
 
-            current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else next_obs[:50]
+            current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else str(next_obs)[:50]
             intrinsic_reward = 0.0
             if current_room not in visited_rooms:
                 visited_rooms.add(current_room)
