@@ -152,7 +152,7 @@ def train_agent():
             if done:
                 break
 
-        if episode % 100 == 0:
+        if episode % 1000 == 0:
             print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
 
 if __name__ == "__main__":
