@@ -4,19 +4,17 @@ import re
 from collections import deque, defaultdict
 from jericho import FrotzEnv
 
-# --- 1. CONFIGURATION & HYPERPARAMETERS ---
-ROM_PATH = "advent.z5"
-MAX_STEPS = 20000
+# --- 1. CONFIGURATION ---
+ROM_PATH = "advent.z5"  # Use the compiled version 5 file
+MAX_STEPS = 10000
 TOTAL_EPISODES = 1000000
 GAMMA = 0.99
 LEARNING_RATE = 0.1
 
-# Epsilon schedule with a persistent floor so exploration never dies out
 EPS_START = 1.0
 EPS_END = 0.05
 EPS_DECAY_EPISODES = 200000
 
-# Standard fallback action vocabulary for unsupported ROMs where get_valid_actions() fails
 FALLBACK_ACTIONS = [
     "north", "south", "east", "west", "up", "down", "in", "out",
     "look", "inventory", "score", "help", "take inventory",
@@ -24,11 +22,7 @@ FALLBACK_ACTIONS = [
     "light lamp", "unlock door", "open door", "examine room", "sw", "se", "nw", "ne"
 ]
 
-# --- 2. TABULAR Q-LEARNING DICTIONARY ---
-# Maps (state_substring, action) -> Q-value to bypass PyTorch autograd graph bugs
 q_table = defaultdict(float)
-
-# --- 3. CURRICULUM STATE BUFFER ---
 state_checkpoint_buffer = []
 state_checkpoint_keys = set()
 
@@ -55,7 +49,6 @@ def get_state_key(obs):
     return obs[:60].strip()
 
 def extract_dynamic_actions(obs, legal_actions):
-    """Dynamically supplement fallback actions using words found in the room description."""
     if isinstance(obs, tuple):
         obs = obs[0]
     if not isinstance(obs, str):
@@ -64,13 +57,11 @@ def extract_dynamic_actions(obs, legal_actions):
     if legal_actions and legal_actions != FALLBACK_ACTIONS:
         return legal_actions
     
-    # Extract potential objects/nouns mentioned in the observation text
     words = re.findall(r'\b[a-z]{3,}\b', obs.lower())
     common_ignore = {'the', 'and', 'you', 'are', 'with', 'that', 'this', 'from', 'have'}
     nouns = [w for w in set(words) if w not in common_ignore]
     
     dynamic_actions = list(FALLBACK_ACTIONS)
-    # Add contextual interactions if nouns appear in the room text
     for noun in nouns[:5]:
         dynamic_actions.extend([f"take {noun}", f"examine {noun}", f"open {noun}", f"use {noun}"])
         
@@ -97,14 +88,12 @@ def train_agent():
         if isinstance(obs, tuple):
             obs = obs[0]
         
-        # Curriculum Learning: 30% chance to spawn from a saved deep-state checkpoint
         if state_checkpoint_buffer and random.random() < 0.3:
             saved_state = random.choice(state_checkpoint_buffer)
             env.set_state(saved_state)
 
         epsilon = get_epsilon(episode)
         episode_score = 0
-        
         recent_actions = deque(maxlen=4)
         episode_rooms = set()
 
@@ -142,7 +131,6 @@ def train_agent():
 
             reward = (score - episode_score) + intrinsic_reward
             
-            # --- Q-TABLE UPDATE (TEMPORAL DIFFERENCE) ---
             next_state_key = get_state_key(next_obs)
             next_legal = env.get_valid_actions()
             if not next_legal:

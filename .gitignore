@@ -35,7 +35,9 @@ Thumbs.db
 .env.*
 
 # Game files
-advent.z5
+*.inf
+*.z5
+*.z6
 
 # GZip Files
 .gz
