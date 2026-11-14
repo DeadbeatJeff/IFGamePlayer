@@ -6,7 +6,6 @@ from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION ---
 ROM_PATH = "advent.z5"
-MAX_STEPS = 800  # Increased to 800 steps per episode for more thorough exploration
 TOTAL_EPISODES = 1000000
 GAMMA = 0.99
 LEARNING_RATE = 0.1
@@ -90,9 +89,13 @@ def train_agent():
     visited_rooms = set()
     global_best_score = 0
 
-    print("Training started successfully. Output will stream below:", flush=True)
+    print("Training started with dynamic step scaling. Output will stream below:", flush=True)
 
     for episode in range(1, TOTAL_EPISODES + 1):
+        # Dynamic step scaling based on global best score achieved so far:
+        # Starts at 100 steps when score is 0, scaling up by 20 steps per point, capped at 800 steps.
+        current_max_steps = min(800, 100 + (global_best_score * 20))
+
         obs = env.reset()
         if isinstance(obs, tuple):
             obs = obs[0]
@@ -106,7 +109,7 @@ def train_agent():
         recent_actions = deque(maxlen=4)
         episode_rooms = set()
 
-        for step in range(MAX_STEPS):
+        for step in range(current_max_steps):
             base_actions = env.get_valid_actions()
             state_key = get_state_key(obs)
             
@@ -186,7 +189,7 @@ def train_agent():
 
         # Print progress every 50 episodes with immediate stream flushing enabled
         if episode % 50 == 0:
-            print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}", flush=True)
+            print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Best Score: {global_best_score} | Max Steps: {current_max_steps} | Steps Run: {step+1}", flush=True)
 
 if __name__ == "__main__":
     train_agent()
