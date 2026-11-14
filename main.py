@@ -5,8 +5,8 @@ from collections import deque, defaultdict
 from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION ---
-ROM_PATH = "advent.z5"  # Use the compiled version 5 file
-MAX_STEPS = 20000
+ROM_PATH = "advent.z5"
+MAX_STEPS = 300
 TOTAL_EPISODES = 1000000
 GAMMA = 0.99
 LEARNING_RATE = 0.1
@@ -25,6 +25,7 @@ FALLBACK_ACTIONS = [
 q_table = defaultdict(float)
 state_checkpoint_buffer = []
 state_checkpoint_keys = set()
+action_cache = {}  # Memoization cache to speed up action generation per room description
 
 def get_epsilon(episode):
     if episode >= EPS_DECAY_EPISODES:
@@ -57,6 +58,10 @@ def extract_dynamic_actions(obs, legal_actions):
     if legal_actions and legal_actions != FALLBACK_ACTIONS:
         return legal_actions
     
+    state_key = obs[:60].strip()
+    if state_key in action_cache:
+        return action_cache[state_key]
+    
     words = re.findall(r'\b[a-z]{3,}\b', obs.lower())
     common_ignore = {'the', 'and', 'you', 'are', 'with', 'that', 'this', 'from', 'have'}
     nouns = [w for w in set(words) if w not in common_ignore]
@@ -65,7 +70,9 @@ def extract_dynamic_actions(obs, legal_actions):
     for noun in nouns[:5]:
         dynamic_actions.extend([f"take {noun}", f"examine {noun}", f"open {noun}", f"use {noun}"])
         
-    return list(set(dynamic_actions))
+    final_actions = list(set(dynamic_actions))
+    action_cache[state_key] = final_actions
+    return final_actions
 
 def select_greedy_action(state_key, legal_actions):
     best_action = legal_actions[0]
@@ -99,11 +106,14 @@ def train_agent():
 
         for step in range(MAX_STEPS):
             base_actions = env.get_valid_actions()
-            legal_actions = extract_dynamic_actions(obs, base_actions)
+            state_key = get_state_key(obs)
+            
+            if state_key in action_cache:
+                legal_actions = action_cache[state_key]
+            else:
+                legal_actions = extract_dynamic_actions(obs, base_actions)
             if not legal_actions:
                 legal_actions = FALLBACK_ACTIONS
-
-            state_key = get_state_key(obs)
 
             if random.random() < epsilon:
                 action = random.choice(legal_actions)
@@ -132,9 +142,9 @@ def train_agent():
             reward = (score - episode_score) + intrinsic_reward
             
             next_state_key = get_state_key(next_obs)
-            next_legal = env.get_valid_actions()
+            next_legal = action_cache.get(next_state_key)
             if not next_legal:
-                next_legal = FALLBACK_ACTIONS
+                next_legal = extract_dynamic_actions(next_obs, env.get_valid_actions())
             
             max_next_q = max([q_table[(next_state_key, a)] for a in next_legal]) if next_legal else 0.0
             
@@ -172,8 +182,9 @@ def train_agent():
             if done:
                 break
 
-        if episode % 1000 == 0:
-            print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}")
+        # Print progress every 100 episodes with real-time flushing enabled
+        if episode % 100 == 0:
+            print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}", flush=True)
 
 if __name__ == "__main__":
     train_agent()
