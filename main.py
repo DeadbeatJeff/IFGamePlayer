@@ -6,7 +6,7 @@ from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION ---
 ROM_PATH = "advent.z5"
-MAX_STEPS = 300
+MAX_STEPS = 100  # Reduced to 100 steps per episode for rapid cycling and quick resets
 TOTAL_EPISODES = 1000000
 GAMMA = 0.99
 LEARNING_RATE = 0.1
@@ -25,7 +25,7 @@ FALLBACK_ACTIONS = [
 q_table = defaultdict(float)
 state_checkpoint_buffer = []
 state_checkpoint_keys = set()
-action_cache = {}  # Memoization cache to speed up action generation per room description
+action_cache = {}  # Memoization cache to speed up dynamic verb generation
 
 def get_epsilon(episode):
     if episode >= EPS_DECAY_EPISODES:
@@ -89,6 +89,8 @@ def train_agent():
     
     visited_rooms = set()
     global_best_score = 0
+
+    print("Training started successfully. Output will stream below:", flush=True)
 
     for episode in range(1, TOTAL_EPISODES + 1):
         obs = env.reset()
@@ -182,8 +184,8 @@ def train_agent():
             if done:
                 break
 
-        # Print progress every 100 episodes with real-time flushing enabled
-        if episode % 100 == 0:
+        # Print progress every 50 episodes with immediate stream flushing enabled
+        if episode % 50 == 0:
             print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Steps: {step+1}", flush=True)
 
 if __name__ == "__main__":
