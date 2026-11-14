@@ -6,7 +6,7 @@ from jericho import FrotzEnv
 
 # --- 1. CONFIGURATION ---
 ROM_PATH = "advent.z5"
-MAX_STEPS = 300  # Increased to 300 steps per episode for more thorough exploration
+MAX_STEPS = 800  # Increased to 800 steps per episode for more thorough exploration
 TOTAL_EPISODES = 1000000
 GAMMA = 0.99
 LEARNING_RATE = 0.1
