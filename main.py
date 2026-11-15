@@ -94,7 +94,7 @@ def train_agent():
     for episode in range(1, TOTAL_EPISODES + 1):
         # Dynamic step scaling based on global best score achieved so far:
         # Starts at 100 steps when score is 0, scaling up by 20 steps per point, capped at 800 steps.
-        current_max_steps = min(800, 100 + (global_best_score * 20))
+        current_max_steps = min(800, 300 + (global_best_score * 20))
 
         obs = env.reset()
         if isinstance(obs, tuple):
