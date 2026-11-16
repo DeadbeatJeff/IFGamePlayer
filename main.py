@@ -24,7 +24,7 @@ FALLBACK_ACTIONS = [
 q_table = defaultdict(float)
 state_checkpoint_buffer = []
 state_checkpoint_keys = set()
-action_cache = {}  # Memoization cache to speed up dynamic verb generation
+action_cache = {}
 
 def get_epsilon(episode):
     if episode >= EPS_DECAY_EPISODES:
@@ -89,18 +89,17 @@ def train_agent():
     visited_rooms = set()
     global_best_score = 0
 
-    print("Training started with dynamic step scaling. Output will stream below:", flush=True)
+    print("Training started with exploratory checkpoint bootstrapping:", flush=True)
 
     for episode in range(1, TOTAL_EPISODES + 1):
-        # Dynamic step scaling based on global best score achieved so far:
-        # Starts at 300 steps when score is 0, scaling up by 20 steps per point, capped at 800 steps.
         current_max_steps = min(800, 300 + (global_best_score * 20))
 
         obs = env.reset()
         if isinstance(obs, tuple):
             obs = obs[0]
         
-        if state_checkpoint_buffer and random.random() < 0.3:
+        # Curriculum Learning: 40% chance to spawn from a saved deep-state checkpoint if available
+        if state_checkpoint_buffer and random.random() < 0.4:
             saved_state = random.choice(state_checkpoint_buffer)
             env.set_state(saved_state)
 
@@ -139,10 +138,11 @@ def train_agent():
 
             current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else str(next_obs)[:50]
             intrinsic_reward = 0.0
-            if current_room not in visited_rooms:
+            is_new_room = current_room not in visited_rooms
+            if is_new_room:
                 visited_rooms.add(current_room)
                 episode_rooms.add(current_room)
-                intrinsic_reward = 0.1
+                intrinsic_reward = 0.2  # Slightly higher curiosity bonus
 
             reward = (score - episode_score) + intrinsic_reward
             
@@ -162,8 +162,14 @@ def train_agent():
 
             if score > global_best_score:
                 global_best_score = score
+
+            # --- BOOTSTRAP CHECKPOINT LOGIC ---
+            # Save checkpoints if score improves OR if the agent successfully explores deep into rooms
+            # This ensures state_checkpoint_buffer populates even when score is 0.
+            should_checkpoint = (score > 0) or (is_new_room and len(episode_rooms) > 5 and len(state_checkpoint_buffer) < 40)
+            
+            if should_checkpoint:
                 current_state = env.get_state()
-                
                 if isinstance(current_state, tuple):
                     state_bytes_key = str(current_state).encode('utf-8')
                 elif hasattr(current_state, 'tobytes'):
@@ -187,7 +193,6 @@ def train_agent():
             if done:
                 break
 
-        # Print progress every 50 episodes with immediate stream flushing enabled
         if episode % 50 == 0:
             print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Best Score: {global_best_score} | Max Steps: {current_max_steps} | Steps Run: {step+1}", flush=True)
 
