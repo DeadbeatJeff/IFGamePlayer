@@ -1,4 +1,3 @@
-import os
 import random
 import re
 from collections import deque, defaultdict
@@ -8,7 +7,7 @@ from jericho import FrotzEnv
 ROM_PATH = "advent.z5"
 TOTAL_EPISODES = 1000000
 GAMMA = 0.99
-LEARNING_RATE = 0.1
+LEARNING_RATE = 0.15
 
 EPS_START = 1.0
 EPS_END = 0.05
@@ -16,9 +15,13 @@ EPS_DECAY_EPISODES = 200000
 
 FALLBACK_ACTIONS = [
     "north", "south", "east", "west", "up", "down", "in", "out",
-    "look", "inventory", "score", "help", "take inventory",
-    "take keys", "take lantern", "take food", "take bottle",
-    "light lamp", "unlock door", "open door", "examine room", "sw", "se", "nw", "ne"
+    "ne", "nw", "se", "sw",
+    "look", "inventory", "score",
+    "get keys", "get lamp", "get food", "get bottle", "get cage", "get rod",
+    "on", "light lamp", "unlock grate", "open grate",
+    "xyzzy", "plugh", "plover", "fee", "fie", "foe", "foo",
+    "wave rod", "pour water", "pour oil", "fill bottle",
+    "drop keys", "drop lamp", "drop food", "drop bottle", "drop cage", "drop rod"
 ]
 
 q_table = defaultdict(float)
@@ -26,56 +29,70 @@ state_checkpoint_buffer = []
 state_checkpoint_keys = set()
 action_cache = {}
 
+
 def get_epsilon(episode):
     if episode >= EPS_DECAY_EPISODES:
         return EPS_END
     return EPS_START - (EPS_START - EPS_END) * (episode / EPS_DECAY_EPISODES)
 
-def parse_score_from_text(obs, fallback_score):
+
+def extract_obs_text(obs):
     if isinstance(obs, tuple):
         obs = obs[0]
     if not isinstance(obs, str):
-        obs = str(obs)
-    match = re.search(r'score[:\s]+(\d+)', obs, re.IGNORECASE)
+        return str(obs)
+    return obs
+
+
+def get_current_score(env, obs_text, step_score, fallback_score):
+    if hasattr(env, "get_score"):
+        try:
+            ram_score = env.get_score()
+            if isinstance(ram_score, (int, float)) and ram_score != 0:
+                return int(ram_score)
+        except Exception:
+            pass
+
+    if isinstance(step_score, (int, float)) and step_score != 0:
+        return int(step_score)
+
+    match = re.search(r"score[:\s]+(-?\d+)", obs_text, re.IGNORECASE)
     if match:
         return int(match.group(1))
+
     return fallback_score
 
-def get_state_key(obs):
-    if isinstance(obs, tuple):
-        obs = obs[0]
-    if not isinstance(obs, str):
-        obs = str(obs)
-    return obs[:60].strip()
 
-def extract_dynamic_actions(obs, legal_actions):
-    if isinstance(obs, tuple):
-        obs = obs[0]
-    if not isinstance(obs, str):
-        obs = str(obs)
-        
-    if legal_actions and legal_actions != FALLBACK_ACTIONS:
-        return legal_actions
-    
-    state_key = obs[:60].strip()
+def get_state_key(obs_text):
+    lines = [line.strip() for line in obs_text.strip().splitlines() if line.strip()]
+    header = lines[0] if lines else obs_text.strip()
+    return header[:60]
+
+
+def get_room_key(obs_text):
+    lines = [line.strip() for line in obs_text.strip().splitlines() if line.strip()]
+    return (lines[0] if lines else obs_text.strip())[:50]
+
+
+def get_actions_for_state(env, obs_text, state_key):
     if state_key in action_cache:
         return action_cache[state_key]
-    
-    words = re.findall(r'\b[a-z]{3,}\b', obs.lower())
-    common_ignore = {'the', 'and', 'you', 'are', 'with', 'that', 'this', 'from', 'have'}
-    nouns = [w for w in set(words) if w not in common_ignore]
-    
-    dynamic_actions = list(FALLBACK_ACTIONS)
-    for noun in nouns[:5]:
-        dynamic_actions.extend([f"take {noun}", f"examine {noun}", f"open {noun}", f"use {noun}"])
-        
-    final_actions = list(set(dynamic_actions))
-    action_cache[state_key] = final_actions
-    return final_actions
+
+    valid = []
+    if hasattr(env, "get_valid_actions"):
+        try:
+            valid = env.get_valid_actions() or []
+        except Exception:
+            valid = []
+
+    actions = list(dict.fromkeys(list(valid) + FALLBACK_ACTIONS))
+    action_cache[state_key] = actions
+    return actions
+
 
 def select_greedy_action(state_key, legal_actions):
     best_action = legal_actions[0]
-    max_q = float('-inf')
+    max_q = float("-inf")
     for action in legal_actions:
         q_val = q_table[(state_key, action)]
         if q_val > max_q:
@@ -83,41 +100,71 @@ def select_greedy_action(state_key, legal_actions):
             best_action = action
     return best_action
 
+
+def record_checkpoint(env, force=False):
+    if not hasattr(env, "get_state"):
+        return
+    try:
+        current_state = env.get_state()
+    except Exception:
+        return
+
+    if isinstance(current_state, tuple):
+        state_bytes_key = str(current_state).encode("utf-8", errors="ignore")
+    elif hasattr(current_state, "tobytes"):
+        state_bytes_key = current_state.tobytes()
+    else:
+        state_bytes_key = str(current_state).encode("utf-8", errors="ignore")
+
+    if state_bytes_key not in state_checkpoint_keys:
+        if len(state_checkpoint_buffer) >= 50 and not force:
+            return
+        state_checkpoint_buffer.append(current_state)
+        state_checkpoint_keys.add(state_bytes_key)
+        if len(state_checkpoint_buffer) > 50:
+            old_state = state_checkpoint_buffer.pop(0)
+            if isinstance(old_state, tuple):
+                old_key = str(old_state).encode("utf-8", errors="ignore")
+            elif hasattr(old_state, "tobytes"):
+                old_key = old_state.tobytes()
+            else:
+                old_key = str(old_state).encode("utf-8", errors="ignore")
+            state_checkpoint_keys.discard(old_key)
+
+
 def train_agent():
     env = FrotzEnv(ROM_PATH)
-    
+
     visited_rooms = set()
     global_best_score = 0
 
-    print("Training started with exploratory checkpoint bootstrapping:", flush=True)
+    print("Training started. Output will stream every 50 episodes:", flush=True)
 
     for episode in range(1, TOTAL_EPISODES + 1):
-        current_max_steps = min(800, 300 + (global_best_score * 20))
+        current_max_steps = min(800, 300 + max(0, global_best_score) * 10)
 
-        obs = env.reset()
-        if isinstance(obs, tuple):
-            obs = obs[0]
-        
-        # Curriculum Learning: 40% chance to spawn from a saved deep-state checkpoint if available
-        if state_checkpoint_buffer and random.random() < 0.4:
+        obs_text = extract_obs_text(env.reset())
+        episode_score = get_current_score(env, obs_text, 0, 0)
+        if episode_score > global_best_score:
+            global_best_score = episode_score
+
+        if state_checkpoint_buffer and random.random() < 0.35:
             saved_state = random.choice(state_checkpoint_buffer)
-            env.set_state(saved_state)
+            try:
+                env.set_state(saved_state)
+                obs_text = extract_obs_text(env.get_observation() if hasattr(env, "get_observation") else obs_text)
+                episode_score = get_current_score(env, obs_text, 0, episode_score)
+            except Exception:
+                pass
 
         epsilon = get_epsilon(episode)
-        episode_score = 0
         recent_actions = deque(maxlen=4)
         episode_rooms = set()
+        step = 0
 
         for step in range(current_max_steps):
-            base_actions = env.get_valid_actions()
-            state_key = get_state_key(obs)
-            
-            if state_key in action_cache:
-                legal_actions = action_cache[state_key]
-            else:
-                legal_actions = extract_dynamic_actions(obs, base_actions)
-            if not legal_actions:
-                legal_actions = FALLBACK_ACTIONS
+            state_key = get_state_key(obs_text)
+            legal_actions = get_actions_for_state(env, obs_text, state_key)
 
             if random.random() < epsilon:
                 action = random.choice(legal_actions)
@@ -125,76 +172,59 @@ def train_agent():
                 action = select_greedy_action(state_key, legal_actions)
 
             recent_actions.append(action)
-            is_looping = len(recent_actions) == 4 and recent_actions[0] == recent_actions[2] and recent_actions[1] == recent_actions[3]
+            is_looping = (
+                len(recent_actions) == 4
+                and recent_actions[0] == recent_actions[2]
+                and recent_actions[1] == recent_actions[3]
+            )
             if is_looping:
                 action = random.choice(legal_actions)
 
-            next_obs, score, done, info = env.step(action)
-            if isinstance(next_obs, tuple):
-                next_obs = next_obs[0]
-            
-            if score == 0:
-                score = parse_score_from_text(next_obs, episode_score)
+            next_obs, step_score, done, _ = env.step(action)
+            next_obs_text = extract_obs_text(next_obs)
+            new_score = get_current_score(env, next_obs_text, step_score, episode_score)
 
-            current_room = env.get_world_state().room if hasattr(env, 'get_world_state') else str(next_obs)[:50]
+            room_key = get_room_key(next_obs_text)
             intrinsic_reward = 0.0
-            is_new_room = current_room not in visited_rooms
+            is_new_room = room_key not in visited_rooms
             if is_new_room:
-                visited_rooms.add(current_room)
-                episode_rooms.add(current_room)
-                intrinsic_reward = 0.2  # Slightly higher curiosity bonus
+                visited_rooms.add(room_key)
+                episode_rooms.add(room_key)
+                intrinsic_reward = 0.1
 
-            reward = (score - episode_score) + intrinsic_reward
-            
-            next_state_key = get_state_key(next_obs)
-            next_legal = action_cache.get(next_state_key)
-            if not next_legal:
-                next_legal = extract_dynamic_actions(next_obs, env.get_valid_actions())
-            
+            score_delta = new_score - episode_score
+            reward = (score_delta * 10.0) + intrinsic_reward
+
+            next_state_key = get_state_key(next_obs_text)
+            next_legal = get_actions_for_state(env, next_obs_text, next_state_key)
             max_next_q = max([q_table[(next_state_key, a)] for a in next_legal]) if next_legal else 0.0
-            
+
             current_q = q_table[(state_key, action)]
-            new_q = current_q + LEARNING_RATE * (reward + GAMMA * max_next_q - current_q)
-            q_table[(state_key, action)] = new_q
+            q_table[(state_key, action)] = current_q + LEARNING_RATE * (
+                reward + GAMMA * max_next_q - current_q
+            )
 
-            episode_score = score
-            obs = next_obs
+            if new_score > global_best_score:
+                global_best_score = new_score
+                record_checkpoint(env, force=True)
+            elif is_new_room and len(episode_rooms) > 4:
+                record_checkpoint(env, force=False)
 
-            if score > global_best_score:
-                global_best_score = score
-
-            # --- BOOTSTRAP CHECKPOINT LOGIC ---
-            # Save checkpoints if score improves OR if the agent successfully explores deep into rooms
-            # This ensures state_checkpoint_buffer populates even when score is 0.
-            should_checkpoint = (score > 0) or (is_new_room and len(episode_rooms) > 5 and len(state_checkpoint_buffer) < 40)
-            
-            if should_checkpoint:
-                current_state = env.get_state()
-                if isinstance(current_state, tuple):
-                    state_bytes_key = str(current_state).encode('utf-8')
-                elif hasattr(current_state, 'tobytes'):
-                    state_bytes_key = current_state.tobytes()
-                else:
-                    state_bytes_key = str(current_state).encode('utf-8')
-                
-                if state_bytes_key not in state_checkpoint_keys:
-                    state_checkpoint_buffer.append(current_state)
-                    state_checkpoint_keys.add(state_bytes_key)
-                    if len(state_checkpoint_buffer) > 50:
-                        old_state = state_checkpoint_buffer.pop(0)
-                        if isinstance(old_state, tuple):
-                            old_key = str(old_state).encode('utf-8')
-                        elif hasattr(old_state, 'tobytes'):
-                            old_key = old_state.tobytes()
-                        else:
-                            old_key = str(old_state).encode('utf-8')
-                        state_checkpoint_keys.discard(old_key)
+            episode_score = new_score
+            obs_text = next_obs_text
 
             if done:
                 break
 
         if episode % 50 == 0:
-            print(f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | Best Score: {global_best_score} | Max Steps: {current_max_steps} | Steps Run: {step+1}", flush=True)
+            print(
+                f"[EPISODE {episode}] | Mapped Rooms: {len(visited_rooms)} | "
+                f"Checkpoints: {len(state_checkpoint_buffer)} | Score: {episode_score} | "
+                f"Best Score: {global_best_score} | Max Steps: {current_max_steps} | "
+                f"Steps Run: {step + 1}",
+                flush=True,
+            )
+
 
 if __name__ == "__main__":
     train_agent()
